@@ -270,6 +270,54 @@ python 1_prepare_data/prepare_device_level_jsonl.py \
 
 Observed at 1 GB input: ~25 seconds per script, 5.8M flows on the target day, output JSONL ≈ 364 MB (home) / 729 MB (device).
 
+### End-to-end example at 1 GB (uncapped)
+
+The full stress-test flow for the 1 GB synthetic CSV, producing the uncapped `ghost_iot_home_1gb.jsonl` and `ghost_iot_devices_1gb.jsonl` and pushing them all the way through the platform:
+
+```bash
+# 1. Generate the 1 GB source CSV (~40s on SSD)
+python 1_prepare_data/generate_synthetic_csv.py \
+  --target-size-gb 1 \
+  --output data/wlan0_ipv4_flows_1gb.csv
+
+# 2. Build the two JSONL files (streaming prep, ~25s each)
+python 1_prepare_data/prepare_home_level_jsonl.py \
+  --input data/wlan0_ipv4_flows_1gb.csv \
+  --output data/ghost_iot_home_1gb.jsonl
+python 1_prepare_data/prepare_device_level_jsonl.py \
+  --input data/wlan0_ipv4_flows_1gb.csv \
+  --output data/ghost_iot_devices_1gb.jsonl
+
+# 3. Upload (multipart kicks in automatically for files > ~5 MB)
+python 2_upload/upload_multipart.py data/ghost_iot_home_1gb.jsonl
+python 2_upload/upload_multipart.py data/ghost_iot_devices_1gb.jsonl
+
+# 4. Create Activity Detection jobs (each references the uploaded filename)
+python 3_batch_jobs/create_activity_detection_job.py \
+  --file ghost_iot_home_1gb.jsonl \
+  --name ghost-iot-home-1gb
+python 3_batch_jobs/create_activity_detection_job.py \
+  --file ghost_iot_devices_1gb.jsonl \
+  --name ghost-iot-devices-1gb
+# Save the two job_ids printed by these commands.
+
+# 5. Download outputs
+python 4_download_outputs/download_outputs.py <home_job_id>   outputs/ghost-iot-home-1gb
+python 4_download_outputs/download_outputs.py <device_job_id> outputs/ghost-iot-devices-1gb
+
+# 6. View results
+python 5_view_results/view_results.py outputs/ghost-iot-home-1gb
+python 5_view_results/view_results.py outputs/ghost-iot-devices-1gb \
+  --input data/ghost_iot_devices_1gb.jsonl
+```
+
+**What to expect:**
+- **Upload** — the 729 MB device file triggers multipart (2 parts); the 364 MB home file may go single-part depending on the platform's threshold.
+- **Job status** — 1 GB uncapped is well beyond any realistic model context window (`inputs[0].data` is ~376 MB / ~100M tokens on the home record). Expect `FAILED` or a prediction with truncation / timeout warnings. That's the value of this run — it pinpoints where the pipeline breaks.
+- **If the job completes** — great, the platform silently handled more context than expected. Inspect `outputs/*/pred_*.jsonl` to see whether Newton actually reasoned over all 5.8M flows or summarized a prefix.
+
+To see the working case on the same 1 GB input, regenerate the JSONL with `--max-flows 5000` (home) and `--max-flows-per-device 5000` (device), then repeat steps 3–6 with the capped filenames.
+
 ### Capping per-record flow counts for Newton
 
 The uncapped JSONL scales linearly with CSV size. At 1 GB input a single home-level `inputs[0].data` already contains 376 MB of flow text (~100M tokens) — far beyond any model context window. Newton's Activity Detection pipeline will very likely truncate, error, or time out on uncapped JSONL at 1 GB+.
