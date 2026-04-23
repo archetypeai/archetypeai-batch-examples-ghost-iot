@@ -311,12 +311,43 @@ python 5_view_results/view_results.py outputs/ghost-iot-devices-1gb \
   --input data/ghost_iot_devices_1gb.jsonl
 ```
 
-**What to expect:**
-- **Upload** — the 729 MB device file triggers multipart (2 parts); the 364 MB home file may go single-part depending on the platform's threshold.
-- **Job status** — 1 GB uncapped is well beyond any realistic model context window (`inputs[0].data` is ~376 MB / ~100M tokens on the home record). Expect `FAILED` or a prediction with truncation / timeout warnings. That's the value of this run — it pinpoints where the pipeline breaks.
-- **If the job completes** — great, the platform silently handled more context than expected. Inspect `outputs/*/pred_*.jsonl` to see whether Newton actually reasoned over all 5.8M flows or summarized a prefix.
+#### Observed failure at 1 GB uncapped (run of `ghost_iot_home_1gb.jsonl`)
 
-To see the working case on the same 1 GB input, regenerate the JSONL with `--max-flows 5000` (home) and `--max-flows-per-device 5000` (device), then repeat steps 3–6 with the capped filenames.
+The home-level run with the uncapped 376 MB `inputs[0].data` reveals a critical failure mode: **the job reports `COMPLETED` but the output is garbage**.
+
+Job events from an actual run:
+
+```
+[3/3] Job events:
+  [06:27:30] INFO  Initializing engine & loading model
+  [06:29:31] INFO  Model loaded & engine initialized
+  [06:29:31] INFO  memory_budget=27.6GB, kv_per_token=57344, max_batch_size=512
+  [06:29:32] INFO  Processing input 0: ghost_iot_home_1gb.jsonl (total_lines=unknown)
+  [06:47:35] INFO  Processed 1 lines (0 failed) from ghost_iot_home_1gb.jsonl
+  [06:47:35] INFO  All inputs processed
+
+ Status: COMPLETED   (~21 minutes wall clock)
+```
+
+Downloaded output:
+
+```bash
+$ python 5_view_results/view_results.py outputs/ghost-iot-home-1gb
+Loaded 1 prediction(s) from outputs/ghost-iot-home-1gb
+
+========================================================================
+[0]
+========================================================================
+3d
+```
+
+**The entire prediction was the 2-character string `"3d"`.** No error metadata in the output JSONL (`{"line_index": 0, "prediction": "3d"}`), no truncation warning in the events.
+
+**What the events are telling us:** `memory_budget=27.6GB, kv_per_token=57344` implies the model has a KV-cache budget of roughly 480K tokens of context. Our input was ~376 MB ≈ 100M tokens, or **~200× the model's context window**. The platform accepted the input, ran the model, and returned whatever fell out — which happened to be noise.
+
+**Takeaway for GTM:** *You cannot trust the `COMPLETED` job status when the input is oversized.* The platform does not enforce a per-record input-size limit at job-creation time, does not warn during processing, and does not surface truncation in the prediction output. The client (you) is responsible for keeping `inputs[0].data` within the model's context window.
+
+For a working run on the same 1 GB input, regenerate with `--max-flows` / `--max-flows-per-device` (see next subsection) and repeat upload/job/download.
 
 ### Capping per-record flow counts for Newton
 
@@ -346,10 +377,12 @@ The cap takes the first N matching flows. The scripts still scan the whole CSV (
 | CSV generation | ✓ | ✓ | ✓ | ✓ (needs ≥200 GB free disk) |
 | Streaming prep (memory) | ✓ | ✓ | ✓ | ✓ |
 | Multipart upload (`2_upload/`) | ✓ | ✓ | ✓ | ⚠ close to 250 GB platform limit |
-| Activity Detection (uncapped input) | ⚠ likely fails | ✗ | ✗ | ✗ |
+| Activity Detection (uncapped input) | ✗ silent garbage ("3d") | ✗ | ✗ | ✗ |
 | Activity Detection (`--max-flows 5000`) | ✓ | ✓ | ✓ | ✓ |
 
-For a pure **upload stress test**, use the uncapped JSONL. For **end-to-end including inference**, use the capped version.
+**Silent garbage, not explicit failure.** See the observed-failure subsection above — at 1 GB uncapped, the job status reports `COMPLETED` but Newton returned a 2-character noise string. You MUST cap `inputs[0].data` client-side for any run that exceeds the model's context window (~480K tokens / ~2 MB of text).
+
+For a pure **upload stress test**, use the uncapped JSONL (the upload pipeline itself is fine — the file lands on the platform intact). For **end-to-end including inference**, use the capped version.
 
 ### Disk-space planning
 
