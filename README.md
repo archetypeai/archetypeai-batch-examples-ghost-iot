@@ -359,18 +359,104 @@ The device-level run with the uncapped 729 MB JSONL (10 records, up to 310 MB ea
 12:32:18 AM  warning  inference.oom         CUDA OOM on batch 0 (10 records), recovering: splitting into 5 + 5
 ```
 
-**What the engine does on OOM:** catches the CUDA out-of-memory exception, bisects the batch, and retries. `max_batch_size=512` is the declared max, but actual batches shrink dynamically when each record carries gigabytes of context. The engine will keep halving (10 → 5+5 → 2+3 → 1+1+…) until it finds a batch size that fits.
+**What the engine does on OOM:** catches the CUDA out-of-memory exception, bisects the batch, and retries. `max_batch_size=512` is the declared max, but actual batches shrink dynamically when each record carries gigabytes of context. The engine halves (10 → 5+5 → 2+3 → 1+1+…) until it finds a batch size that fits.
 
-**Why batch-halving doesn't rescue this run:** the problem isn't batch size — it's per-record size. A single device record here is ~310 MB ≈ 80M tokens vs. the model's ~480K-token context. Even at batch size 1 the record overflows context. The engine will either OOM again (and eventually error) or silently truncate and return a `"3d"`-style garbage string per record.
+In this run, the 5+5 split was enough. The engine logged `Batch 0 recovered successfully after OOM split` and finished processing ~34 minutes later:
 
-**Takeaway for GTM:** the engine has *graceful* OOM recovery at the batch level, but *no* recovery for per-record oversize. A job with many small records will self-tune its batch size; a job with few huge records still fails — visibly via OOM warnings if you watch the events, or invisibly via truncated output if you only check `status`.
+```
+12:32:18 AM  warning  inference.oom        CUDA OOM on batch 0 (10 records), recovering: splitting into 5 + 5
+01:06:07 AM  info     inference.oom        Batch 0 recovered successfully after OOM split
+01:06:07 AM  info     inference.completed  Processed 10 lines (0 failed) from ghost_iot_devices_1gb.jsonl
+01:06:07 AM  info     inference.completed  All inputs processed
+```
+
+**"0 failed" is not success.** Downloaded and inspected, the predictions tell the real story:
+
+```bash
+$ python 4_download_outputs/download_outputs.py \
+    job_5c8prnev5w9crsqt1nr02j96cc outputs/ghost-iot-devices-1gb
+============================================================
+ Download Batch Job Outputs
+============================================================
+  Job:    job_5c8prnev5w9crsqt1nr02j96cc
+  Saving: outputs/ghost-iot-devices-1gb/
+
+[1/2] Fetching output list...
+  Fetched 1/1 output records...
+  Total: 1 files
+
+[2/2] Downloading 1 files...
+  [100.0%] 1/1  inp_79apa290ea9ck9jc8mqwrn5681_output.jsonl  (0.0 MB/s)
+
+  Done! 1 files, 0.0 MB in 0.8s
+  Saved to: outputs/ghost-iot-devices-1gb/
+
+$ python 5_view_results/view_results.py outputs/ghost-iot-devices-1gb \
+    --input data/ghost_iot_devices_1gb.jsonl
+Loaded 10 prediction(s) from outputs/ghost-iot-devices-1gb
+Paired with 10 input record(s) from data/ghost_iot_devices_1gb.jsonl
+
+========================================================================
+[0] device mac=13d35af5c06b
+========================================================================
+304
+
+========================================================================
+[1] device mac=d96b0fddf228
+========================================================================
+7
+
+========================================================================
+[2] device mac=e323b826aa71
+========================================================================
+b
+
+========================================================================
+[3] device mac=824ec8a8e2da
+========================================================================
+
+
+========================================================================
+[4] device mac=ebd1a7fa8544
+========================================================================
+
+
+========================================================================
+[5] device mac=594cbdb38e7d
+========================================================================
+
+
+========================================================================
+[6] device mac=cec6ed3953d7
+========================================================================
+
+
+========================================================================
+[7] device mac=a9d4a81fc394
+========================================================================
+
+
+========================================================================
+[8] device mac=e7618ccb16b5
+========================================================================
+
+
+========================================================================
+[9] device mac=a6f4e9445c56
+========================================================================
+
+```
+
+**7 of 10 predictions are empty strings; 3 are 1–3 character noise (`"304"`, `"7"`, `"b"`).** Every record carries tens of millions of input tokens vs. the model's ~480K-token context — even with batch size reduced, individual records overflow context and the model emits nothing meaningful. The top 3 devices (which had the most flows, and also the largest input payloads) produced at least a few random characters; the 7 smaller devices produced empty strings.
+
+**Takeaway for GTM:** the engine has *graceful* OOM recovery at the batch level, but *no* recovery for per-record oversize. A job with many small records will self-tune its batch size; a job with few huge records completes with `status: COMPLETED`, `0 failed`, and empty or garbage predictions. The only signal of failure is in the output text itself — you have to read every prediction to know whether the job actually did anything useful.
 
 #### Summary of observed failure modes at 1 GB uncapped
 
-| Scenario | Records × per-record size | What happened | Visible signal |
+| Scenario | Records × per-record size | What happened | Signal |
 |---|---|---|---|
-| `ghost_iot_home_1gb.jsonl` | 1 × 376 MB | COMPLETED status, prediction = `"3d"` | Only by reading the output |
-| `ghost_iot_devices_1gb.jsonl` | 10 × ~1–310 MB | CUDA OOM, auto batch-halving | `warning: inference.oom` event |
+| `ghost_iot_home_1gb.jsonl` | 1 × 376 MB | `COMPLETED`, prediction = `"3d"` | Only visible by reading the output |
+| `ghost_iot_devices_1gb.jsonl` | 10 × ~1–310 MB | CUDA OOM → batch halved 10→5+5 → `COMPLETED` with 7/10 empty predictions, 3/10 1–3 char noise | `warning: inference.oom` event + empty predictions in output |
 
 For a working run on the same 1 GB input, regenerate with `--max-flows` / `--max-flows-per-device` (see next subsection) and repeat upload/job/download.
 
