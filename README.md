@@ -249,28 +249,42 @@ Memory stays bounded at both stages regardless of source CSV size. At 1 GB the f
 ### Map stage: `prepare_hourly_home_jsonl.py`
 
 ```bash
-# Cap each hour at 100 flows (~6.6 KB per record, ~1.6K tokens).
-# Higher caps work in theory but the observed platform limit is surprisingly
-# low — 1000 flows/hour (~16K tokens per record) still OOMs at batch=1.
+# Default cap is 150 flows/hour (~9.9 KB per record, ~2.5K tokens).
+# Empirically determined ceiling — see "Platform per-record limit" below.
 python 1_prepare_data/prepare_hourly_home_jsonl.py \
   --input data/wlan0_ipv4_flows_1gb.csv \
-  --output data/ghost_iot_home_hourly_1gb_cap100.jsonl \
-  --max-flows-per-hour 100
+  --output data/ghost_iot_home_hourly_1gb.jsonl
 ```
 
 Output: 24-line JSONL. Each record's prompt identifies its hour (`Hour: 15:00-16:00 UTC`) so the reduce stage can sort by `line_index`.
 
+#### Platform per-record limit (observed)
+
+Per an internal note, the Activity Detection pipeline advertises a **16K-token model context window**. In practice the per-record limit is tighter due to activation memory and pre-allocated batch overhead. Binary search on the 1 GB home-level hourly pipeline (24 records) produced:
+
+| `--max-flows-per-hour` | Per-record ~tokens | Result |
+|---|---|---|
+| 5000 | ~80K | FAILED — 5 consecutive OOMs, pod restart |
+| 1000 | ~16K | FAILED — 5 consecutive OOMs, pod restart |
+| 500 | ~8K | FAILED — 5 consecutive OOMs, pod restart |
+| 300 | ~5K | FAILED — 5 consecutive OOMs, pod restart |
+| 200 | ~3.3K | FAILED — OOMs down to bs=1, pod restart |
+| **150** | **~2.5K** | **✓ COMPLETED** — 2 OOMs recovered (bs=24→12→6) |
+| 100 | ~1.6K | ✓ COMPLETED — 1 OOM recovered (bs=24→12) |
+
+The practical per-record ceiling is between **150 and 200 flows** for the GHOST-IoT schema (~16 tokens per flow row). At higher caps, even a single record at batch size 1 can't fit in GPU memory — despite the 16K context budget suggesting it should. Suspected causes: fixed activation overhead, pre-allocated max-batch-size memory, or other runtime allocations that crowd out room for actual input.
+
 ### Run map
 
 ```bash
-python 2_upload/upload_multipart.py data/ghost_iot_home_hourly_1gb_cap100.jsonl
+python 2_upload/upload_multipart.py data/ghost_iot_home_hourly_1gb.jsonl
 
 python 3_batch_jobs/create_activity_detection_job.py \
-  --file ghost_iot_home_hourly_1gb_cap100.jsonl \
-  --name ghost-iot-home-hourly-1gb-cap100
-# Observed: 24 records, 1 OOM (24 -> 12+12) auto-recovered, COMPLETED in ~4 min.
+  --file ghost_iot_home_hourly_1gb.jsonl \
+  --name ghost-iot-home-hourly-1gb
+# Observed at cap=150: 24 records, 2 OOMs (24→12→6) auto-recovered, COMPLETED in ~7 min.
 
-python 4_download_outputs/download_outputs.py <job_id> outputs/ghost-iot-home-hourly-1gb-cap100
+python 4_download_outputs/download_outputs.py <job_id> outputs/ghost-iot-home-hourly-1gb
 ```
 
 Each of the 24 predictions is a real narrative referencing actual flow data for that hour (e.g., "During the 15:00-16:00 UTC hour the home network saw 242,130 flows dominated by DNS and HTTPS; the most-active device was `13d35af5c06b`…").
