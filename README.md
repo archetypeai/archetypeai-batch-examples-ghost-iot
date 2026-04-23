@@ -347,6 +347,31 @@ Loaded 1 prediction(s) from outputs/ghost-iot-home-1gb
 
 **Takeaway for GTM:** *You cannot trust the `COMPLETED` job status when the input is oversized.* The platform does not enforce a per-record input-size limit at job-creation time, does not warn during processing, and does not surface truncation in the prediction output. The client (you) is responsible for keeping `inputs[0].data` within the model's context window.
 
+#### Observed failure at 1 GB uncapped (run of `ghost_iot_devices_1gb.jsonl`)
+
+The device-level run with the uncapped 729 MB JSONL (10 records, up to 310 MB each in `inputs[0].data`) exposes a different failure mode — **CUDA OOM** during batch inference, with automatic recovery:
+
+```
+11:55:08 PM  info     inference.init        Initializing engine & loading model
+11:57:02 PM  info     inference.init        Model loaded & engine initialized
+11:57:02 PM  info     inference.started     memory_budget=27.6GB, kv_per_token=57344, max_batch_size=512
+11:57:02 PM  info     inference.processing  Processing input 0: ghost_iot_devices_1gb.jsonl (total_lines=unknown)
+12:32:18 AM  warning  inference.oom         CUDA OOM on batch 0 (10 records), recovering: splitting into 5 + 5
+```
+
+**What the engine does on OOM:** catches the CUDA out-of-memory exception, bisects the batch, and retries. `max_batch_size=512` is the declared max, but actual batches shrink dynamically when each record carries gigabytes of context. The engine will keep halving (10 → 5+5 → 2+3 → 1+1+…) until it finds a batch size that fits.
+
+**Why batch-halving doesn't rescue this run:** the problem isn't batch size — it's per-record size. A single device record here is ~310 MB ≈ 80M tokens vs. the model's ~480K-token context. Even at batch size 1 the record overflows context. The engine will either OOM again (and eventually error) or silently truncate and return a `"3d"`-style garbage string per record.
+
+**Takeaway for GTM:** the engine has *graceful* OOM recovery at the batch level, but *no* recovery for per-record oversize. A job with many small records will self-tune its batch size; a job with few huge records still fails — visibly via OOM warnings if you watch the events, or invisibly via truncated output if you only check `status`.
+
+#### Summary of observed failure modes at 1 GB uncapped
+
+| Scenario | Records × per-record size | What happened | Visible signal |
+|---|---|---|---|
+| `ghost_iot_home_1gb.jsonl` | 1 × 376 MB | COMPLETED status, prediction = `"3d"` | Only by reading the output |
+| `ghost_iot_devices_1gb.jsonl` | 10 × ~1–310 MB | CUDA OOM, auto batch-halving | `warning: inference.oom` event |
+
 For a working run on the same 1 GB input, regenerate with `--max-flows` / `--max-flows-per-device` (see next subsection) and repeat upload/job/download.
 
 ### Capping per-record flow counts for Newton
@@ -377,10 +402,11 @@ The cap takes the first N matching flows. The scripts still scan the whole CSV (
 | CSV generation | ✓ | ✓ | ✓ | ✓ (needs ≥200 GB free disk) |
 | Streaming prep (memory) | ✓ | ✓ | ✓ | ✓ |
 | Multipart upload (`2_upload/`) | ✓ | ✓ | ✓ | ⚠ close to 250 GB platform limit |
-| Activity Detection (uncapped input) | ✗ silent garbage ("3d") | ✗ | ✗ | ✗ |
+| Activity Detection, 1-record uncapped | ✗ silent garbage ("3d") | ✗ | ✗ | ✗ |
+| Activity Detection, N-record uncapped | ⚠ CUDA OOM + batch-halving | ✗ | ✗ | ✗ |
 | Activity Detection (`--max-flows 5000`) | ✓ | ✓ | ✓ | ✓ |
 
-**Silent garbage, not explicit failure.** See the observed-failure subsection above — at 1 GB uncapped, the job status reports `COMPLETED` but Newton returned a 2-character noise string. You MUST cap `inputs[0].data` client-side for any run that exceeds the model's context window (~480K tokens / ~2 MB of text).
+**Two failure modes observed at 1 GB uncapped.** A single-record run returns `COMPLETED` with garbage text. A multi-record run surfaces `warning: inference.oom` events with automatic batch-halving recovery but still fails to produce useful output per record. See the "Observed failure" subsections above for the detailed event logs. You MUST cap `inputs[0].data` client-side for any run that exceeds the model's context window (~480K tokens / ~2 MB of text).
 
 For a pure **upload stress test**, use the uncapped JSONL (the upload pipeline itself is fine — the file lands on the platform intact). For **end-to-end including inference**, use the capped version.
 
