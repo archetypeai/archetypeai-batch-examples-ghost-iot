@@ -1,0 +1,22 @@
+.env
+myenv/
+__pycache__/
+*.pyc
+outputs/
+.DS_Store
+
+# Synthetic stress-test CSVs — generated locally, don't commit
+data/wlan0_ipv4_flows_large.csv
+data/*_synthetic*.csv
+data/*_large.csv
+data/*_smoke*.csv
+data/*_smoke*.jsonl
+data/wlan0_ipv4_flows_*gb.csv
+data/wlan0_ipv4_flows_*mb.csv
+
+# Large generated JSONL from stress tests (keep only the small reference ones)
+data/ghost_iot_home_*gb.jsonl
+data/ghost_iot_home_*mb.jsonl
+data/ghost_iot_devices_*gb.jsonl
+data/ghost_iot_devices_*mb.jsonl
+data/*_capped*.jsonl
