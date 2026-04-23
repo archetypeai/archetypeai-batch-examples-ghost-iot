@@ -41,7 +41,7 @@ AUTH = {"Authorization": f"Bearer {API_KEY}"}
 TERMINAL_STATUSES = {"COMPLETED", "FAILED", "CANCELLED"}
 
 
-def build_payload(file_id: str, name: str) -> dict:
+def build_payload(file_id: str, name: str, max_new_tokens: int) -> dict:
     return {
         "name": name,
         "pipeline_type": "batch",
@@ -55,7 +55,7 @@ def build_payload(file_id: str, name: str) -> dict:
                 "config": {
                     "generation": {
                         "do_sample": True,
-                        "max_new_tokens": 256,
+                        "max_new_tokens": max_new_tokens,
                         "repetition_penalty": 1,
                         "temperature": 0.7,
                         "top_k": 20,
@@ -109,10 +109,13 @@ def main():
                         help="Job name (default: derived from --file)")
     parser.add_argument("--poll-interval", type=int, default=10,
                         help="Seconds between status polls (default: 10)")
+    parser.add_argument("--max-new-tokens", type=int, default=1024,
+                        help="Maximum tokens Newton may generate per record (default: 1024). "
+                             "Bump to 2048+ for reduce calls that need to synthesize multi-paragraph summaries.")
     args = parser.parse_args()
 
     name = args.name or default_job_name(args.file)
-    payload = build_payload(args.file, name)
+    payload = build_payload(args.file, name, args.max_new_tokens)
 
     print("=" * 60)
     print(" Archetype AI Activity Detection Job")

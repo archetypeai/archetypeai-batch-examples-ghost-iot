@@ -39,7 +39,7 @@ curl -s -X POST "$BASE_URL/batch/jobs" \
         "config": {
           "generation": {
             "do_sample": true,
-            "max_new_tokens": 256,
+            "max_new_tokens": 1024,
             "repetition_penalty": 1,
             "temperature": 0.7,
             "top_k": 20,
@@ -70,7 +70,7 @@ curl -s -X POST "$BASE_URL/batch/jobs" \
         "config": {
           "generation": {
             "do_sample": true,
-            "max_new_tokens": 256,
+            "max_new_tokens": 1024,
             "repetition_penalty": 1,
             "temperature": 0.7,
             "top_k": 20,

@@ -28,6 +28,8 @@ else
   JOB_NAME="${STEM}-activity-detection"
 fi
 
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+
 echo "============================================================"
 echo " Archetype AI Activity Detection Job (Shell)"
 echo "============================================================"
@@ -53,7 +55,7 @@ JOB_RESPONSE=$(/usr/bin/curl -s -X POST "$BASE_URL/batch/jobs" \
         \"config\": {
           \"generation\": {
             \"do_sample\": true,
-            \"max_new_tokens\": 256,
+            \"max_new_tokens\": $MAX_NEW_TOKENS,
             \"repetition_penalty\": 1,
             \"temperature\": 0.7,
             \"top_k\": 20,
