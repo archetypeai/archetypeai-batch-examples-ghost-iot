@@ -349,26 +349,50 @@ Loaded 1 prediction(s) from outputs/ghost-iot-home-1gb
 
 #### Observed failure at 1 GB uncapped (run of `ghost_iot_devices_1gb.jsonl`)
 
-The device-level run with the uncapped 729 MB JSONL (10 records, up to 310 MB each in `inputs[0].data`) exposes a different failure mode — **CUDA OOM** during batch inference, with automatic recovery:
+The device-level run with the uncapped 729 MB JSONL (10 records, up to 310 MB each in `inputs[0].data`) exposes a different failure mode — **CUDA OOM** during batch inference, with automatic recovery. Full job-creation trace as printed by the script:
 
-```
-11:55:08 PM  info     inference.init        Initializing engine & loading model
-11:57:02 PM  info     inference.init        Model loaded & engine initialized
-11:57:02 PM  info     inference.started     memory_budget=27.6GB, kv_per_token=57344, max_batch_size=512
-11:57:02 PM  info     inference.processing  Processing input 0: ghost_iot_devices_1gb.jsonl (total_lines=unknown)
-12:32:18 AM  warning  inference.oom         CUDA OOM on batch 0 (10 records), recovering: splitting into 5 + 5
+```bash
+$ python 3_batch_jobs/create_activity_detection_job.py \
+    --file ghost_iot_devices_1gb.jsonl \
+    --name ghost-iot-devices-1gb
+============================================================
+ Archetype AI Activity Detection Job
+============================================================
+ file_id: ghost_iot_devices_1gb.jsonl
+ name:    ghost-iot-devices-1gb
+
+[1/3] Creating activity detection job...
+      job_id:   job_5c8prnev5w9crsqt1nr02j96cc
+      name:     ghost-iot-devices-1gb
+      pipeline: activity-detection v1.1.0
+      status:   PENDING
+
+[2/3] Monitoring job status...
+      [23:54:28] PENDING
+      [23:54:59] ADMITTED
+      [23:55:09] RUNNING
+      [01:06:32] COMPLETED
+
+[3/3] Job events:
+     [06:55:08] INFO  Initializing engine & loading model
+     [06:57:02] INFO  Model loaded & engine initialized
+     [06:57:02] INFO  memory_budget=27.6GB, kv_per_token=57344, max_batch_size=512
+     [06:57:02] INFO  Processing input 0: ghost_iot_devices_1gb.jsonl (total_lines=unknown)
+     [07:32:18] WARN  CUDA OOM on batch 0 (10 records), recovering: splitting into 5 + 5
+     [08:06:07] INFO  Batch 0 recovered successfully after OOM split
+     [08:06:07] INFO  Processed 10 lines (0 failed) from ghost_iot_devices_1gb.jsonl
+     [08:06:07] INFO  All inputs processed
+
+============================================================
+ Job job_5c8prnev5w9crsqt1nr02j96cc
+ Status: COMPLETED
+ Completed: 2026-04-23T08:06:23.669140Z
+============================================================
 ```
 
-**What the engine does on OOM:** catches the CUDA out-of-memory exception, bisects the batch, and retries. `max_batch_size=512` is the declared max, but actual batches shrink dynamically when each record carries gigabytes of context. The engine halves (10 → 5+5 → 2+3 → 1+1+…) until it finds a batch size that fits.
+Wall clock: **1 hour 12 minutes** (2 min queue/admission, 2 min model load, 35 min first-attempt processing + OOM, 34 min recovery).
 
-In this run, the 5+5 split was enough. The engine logged `Batch 0 recovered successfully after OOM split` and finished processing ~34 minutes later:
-
-```
-12:32:18 AM  warning  inference.oom        CUDA OOM on batch 0 (10 records), recovering: splitting into 5 + 5
-01:06:07 AM  info     inference.oom        Batch 0 recovered successfully after OOM split
-01:06:07 AM  info     inference.completed  Processed 10 lines (0 failed) from ghost_iot_devices_1gb.jsonl
-01:06:07 AM  info     inference.completed  All inputs processed
-```
+**What the engine does on OOM:** catches the CUDA out-of-memory exception, bisects the batch, and retries. `max_batch_size=512` is the declared max, but actual batches shrink dynamically when each record carries gigabytes of context. The engine halves (10 → 5+5 → 2+3 → 1+1+…) until it finds a batch size that fits. In this run the 5+5 split was enough — the `WARN CUDA OOM on batch 0 (10 records), recovering: splitting into 5 + 5` event was followed 34 minutes later by `INFO Batch 0 recovered successfully after OOM split` and the job ended with `COMPLETED` + `0 failed`.
 
 **"0 failed" is not success.** Downloaded and inspected, the predictions tell the real story:
 
