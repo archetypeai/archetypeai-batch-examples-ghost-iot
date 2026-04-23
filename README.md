@@ -216,6 +216,97 @@ python 5_view_results/view_results.py outputs/devices --input data/ghost_iot_dev
 python 5_view_results/view_results.py outputs/devices --input data/ghost_iot_devices_yesterday.jsonl --show-prompt
 ```
 
+## 7. Scale Testing with Synthetic Data
+
+The included GHOST-IoT CSV is tiny (600 KB). To stress test the end-to-end pipeline (upload → job → download) at realistic sizes, use the synthetic generator to produce 1 GB, 10 GB, 100 GB, or 200 GB WiFi flow CSVs.
+
+### Generator
+
+`1_prepare_data/generate_synthetic_csv.py` samples rows from the real GHOST-IoT CSV with replacement, randomizes their timestamps to fall within the target UTC day (default `2019-10-19`), and optionally jitters byte/packet counts (±20%) to avoid exact duplicates. Output preserves the source schema so all downstream scripts work unchanged.
+
+Before running, the script prints a disk-space pre-flight check and an estimated runtime (~150k rows/sec on a typical SSD).
+
+```bash
+# 1 GB  (~5.5M rows, ~40 seconds)
+python 1_prepare_data/generate_synthetic_csv.py \
+  --target-size-gb 1 \
+  --output data/wlan0_ipv4_flows_1gb.csv
+
+# 10 GB  (~55M rows, ~6 minutes)
+python 1_prepare_data/generate_synthetic_csv.py \
+  --target-size-gb 10 \
+  --output data/wlan0_ipv4_flows_10gb.csv
+
+# 100 GB  (~550M rows, ~1 hour)
+python 1_prepare_data/generate_synthetic_csv.py \
+  --target-size-gb 100 \
+  --output data/wlan0_ipv4_flows_100gb.csv
+
+# 200 GB  (~1.1B rows, ~2 hours; requires ≥200 GB free disk)
+python 1_prepare_data/generate_synthetic_csv.py \
+  --target-size-gb 200 \
+  --output data/wlan0_ipv4_flows_200gb.csv
+```
+
+Other useful flags: `--target-size-mb`, `--rows N` (exact row count), `--date YYYY-MM-DD`, `--seed N`, `--no-jitter`.
+
+All `data/wlan0_ipv4_flows_*gb.csv` / `*_mb.csv` files are `.gitignore`d so they won't accidentally be committed.
+
+### Running the prep scripts at scale
+
+Both `prepare_home_level_jsonl.py` and `prepare_device_level_jsonl.py` stream the source CSV — memory is constant regardless of input size. Use `--input` to point them at the synthetic file:
+
+```bash
+# Home-level (1 JSONL line containing all filtered flows)
+python 1_prepare_data/prepare_home_level_jsonl.py \
+  --input data/wlan0_ipv4_flows_1gb.csv \
+  --output data/ghost_iot_home_1gb.jsonl
+
+# Device-level (1 JSONL line per active device)
+python 1_prepare_data/prepare_device_level_jsonl.py \
+  --input data/wlan0_ipv4_flows_1gb.csv \
+  --output data/ghost_iot_devices_1gb.jsonl
+```
+
+Observed at 1 GB input: ~25 seconds per script, 5.8M flows on the target day, output JSONL ≈ 364 MB (home) / 729 MB (device).
+
+### Capping per-record flow counts for Newton
+
+The uncapped JSONL scales linearly with CSV size. At 1 GB input a single home-level `inputs[0].data` already contains 376 MB of flow text (~100M tokens) — far beyond any model context window. Newton's Activity Detection pipeline will very likely truncate, error, or time out on uncapped JSONL at 1 GB+.
+
+To produce JSONL the model can actually process, cap the per-record flow count:
+
+```bash
+# ~5000 flows → ~100-300 KB per record, well within context limits
+python 1_prepare_data/prepare_home_level_jsonl.py \
+  --input data/wlan0_ipv4_flows_10gb.csv \
+  --output data/ghost_iot_home_10gb_capped.jsonl \
+  --max-flows 5000
+
+python 1_prepare_data/prepare_device_level_jsonl.py \
+  --input data/wlan0_ipv4_flows_10gb.csv \
+  --output data/ghost_iot_devices_10gb_capped.jsonl \
+  --max-flows-per-device 5000
+```
+
+The cap takes the first N matching flows. The scripts still scan the whole CSV (so flow counts in the prompt are accurate), but only the first N rows per record end up in `inputs[0].data`.
+
+### What you're actually testing
+
+| Layer | 1 GB | 10 GB | 100 GB | 200 GB |
+|---|---|---|---|---|
+| CSV generation | ✓ | ✓ | ✓ | ✓ (needs ≥200 GB free disk) |
+| Streaming prep (memory) | ✓ | ✓ | ✓ | ✓ |
+| Multipart upload (`2_upload/`) | ✓ | ✓ | ✓ | ⚠ close to 250 GB platform limit |
+| Activity Detection (uncapped input) | ⚠ likely fails | ✗ | ✗ | ✗ |
+| Activity Detection (`--max-flows 5000`) | ✓ | ✓ | ✓ | ✓ |
+
+For a pure **upload stress test**, use the uncapped JSONL. For **end-to-end including inference**, use the capped version.
+
+### Disk-space planning
+
+Running all four targets back-to-back without cleanup needs 311 GB of free space (1 + 10 + 100 + 200). If disk is tight, generate → upload → delete → move to the next target. The generator refuses to start if the target size would exceed 90% of free disk.
+
 ## Why this design
 
 **One home-level prompt vs. hourly chunks.** A single daily prompt produces a compact story. Chunking by hour would yield 24 paragraphs with more temporal detail — easy to switch to by changing the prepare script if desired.
