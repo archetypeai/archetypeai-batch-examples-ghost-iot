@@ -15,8 +15,13 @@ data/wlan0_ipv4_flows_*gb.csv
 data/wlan0_ipv4_flows_*mb.csv
 
 # Large generated JSONL from stress tests (keep only the small reference ones)
-data/ghost_iot_home_*gb.jsonl
-data/ghost_iot_home_*mb.jsonl
-data/ghost_iot_devices_*gb.jsonl
-data/ghost_iot_devices_*mb.jsonl
+data/ghost_iot_home_*gb*.jsonl
+data/ghost_iot_home_*mb*.jsonl
+data/ghost_iot_devices_*gb*.jsonl
+data/ghost_iot_devices_*mb*.jsonl
+data/ghost_iot_home_hourly*.jsonl
+data/ghost_iot_devices_hourly*.jsonl
+data/ghost_iot_home_daily_*.jsonl
+data/ghost_iot_devices_daily_*.jsonl
 data/*_capped*.jsonl
+data/*_cap*.jsonl
