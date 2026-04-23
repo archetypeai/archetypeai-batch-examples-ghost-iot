@@ -9,6 +9,8 @@ Modeled on [archetypeai-batch-examples-volve](https://github.com/archetypeai/arc
 
 ## Pipeline
 
+**Simple pattern** — one JSONL record carries the whole filtered day. Works for small inputs (hundreds of flows). Used in sections 2–6 of this README.
+
 ```
 CSV flows ──┬─► prepare_home_level_jsonl.py     ─► ghost_iot_home_yesterday.jsonl   (1 prompt)
             └─► prepare_device_level_jsonl.py   ─► ghost_iot_devices_yesterday.jsonl (N prompts)
@@ -24,9 +26,26 @@ CSV flows ──┬─► prepare_home_level_jsonl.py     ─► ghost_iot_home_
                           natural-language narratives
 ```
 
+**MapReduce pattern** — required for GB-scale inputs where a single JSONL record would exceed the model's effective context. Used in [section 7](#7-scaling-with-mapreduce-recommended-pattern).
+
+```
+large CSV ──► prepare_hourly_home_jsonl.py  ─► 24-line JSONL (one per UTC hour, capped)
+                    │ upload + Activity Detection (MAP)
+                    ▼
+          24 hourly narratives
+                    │ prepare_daily_summary_from_hourly_jsonl.py (REDUCE)
+                    ▼
+          1-line JSONL (24 summaries concatenated)
+                    │ upload + Activity Detection
+                    ▼
+          1 daily narrative
+```
+
 | Step | Script | Description |
 |------|--------|-------------|
-| Prepare | `1_prepare_data/` | Build JSONL prompts from the raw CSV |
+| Prepare (simple) | `1_prepare_data/prepare_{home,device}_level_jsonl.py` | Build one-record-per-scope JSONL |
+| Prepare (map) | `1_prepare_data/prepare_hourly_home_jsonl.py` | Build 24-record hourly JSONL (one per UTC hour) |
+| Prepare (reduce) | `1_prepare_data/prepare_daily_summary_from_hourly_jsonl.py` | Fold 24 hourly predictions into a daily-summary prompt |
 | Upload | `2_upload/` | Multipart presigned-URL upload (Python/shell/curl) |
 | Batch job | `3_batch_jobs/` | Create & monitor the Activity Detection job |
 | Download | `4_download_outputs/` | Paginated download of prediction files |
@@ -216,7 +235,105 @@ python 5_view_results/view_results.py outputs/devices --input data/ghost_iot_dev
 python 5_view_results/view_results.py outputs/devices --input data/ghost_iot_devices_yesterday.jsonl --show-prompt
 ```
 
-## 7. Scale Testing with Synthetic Data
+## 7. Scaling with MapReduce (recommended pattern)
+
+For inputs that exceed the model's effective context limit — which is much smaller than the KV-cache budget suggests because attention is O(N²) in working memory — the single-record approach shown in sections 2–6 doesn't work. Activity Detection on a single record carrying all of "yesterday" either silently truncates (section 8 below) or OOMs unrecoverably.
+
+The working pattern is **MapReduce-style**:
+
+1. **Map stage.** Split the filtered data into small, uniformly-sized per-hour records. One JSONL with 24 lines, each containing a capped sample of that hour's flows. Newton produces 24 per-hour narratives.
+2. **Reduce stage.** Build a new 1-line JSONL whose `inputs[0].data` is a concatenation of the 24 hourly predictions. Newton synthesizes a single daily narrative from them.
+
+Memory stays bounded at both stages regardless of source CSV size. At 1 GB the full pipeline runs in ~9 minutes of wall clock and produces a grounded daily summary.
+
+### Map stage: `prepare_hourly_home_jsonl.py`
+
+```bash
+# Cap each hour at 100 flows (~6.6 KB per record, ~1.6K tokens).
+# Higher caps work in theory but the observed platform limit is surprisingly
+# low — 1000 flows/hour (~16K tokens per record) still OOMs at batch=1.
+python 1_prepare_data/prepare_hourly_home_jsonl.py \
+  --input data/wlan0_ipv4_flows_1gb.csv \
+  --output data/ghost_iot_home_hourly_1gb_cap100.jsonl \
+  --max-flows-per-hour 100
+```
+
+Output: 24-line JSONL. Each record's prompt identifies its hour (`Hour: 15:00-16:00 UTC`) so the reduce stage can sort by `line_index`.
+
+### Run map
+
+```bash
+python 2_upload/upload_multipart.py data/ghost_iot_home_hourly_1gb_cap100.jsonl
+
+python 3_batch_jobs/create_activity_detection_job.py \
+  --file ghost_iot_home_hourly_1gb_cap100.jsonl \
+  --name ghost-iot-home-hourly-1gb-cap100
+# Observed: 24 records, 1 OOM (24 -> 12+12) auto-recovered, COMPLETED in ~4 min.
+
+python 4_download_outputs/download_outputs.py <job_id> outputs/ghost-iot-home-hourly-1gb-cap100
+```
+
+Each of the 24 predictions is a real narrative referencing actual flow data for that hour (e.g., "During the 15:00-16:00 UTC hour the home network saw 242,130 flows dominated by DNS and HTTPS; the most-active device was `13d35af5c06b`…").
+
+### Reduce stage: `prepare_daily_summary_from_hourly_jsonl.py`
+
+```bash
+python 1_prepare_data/prepare_daily_summary_from_hourly_jsonl.py \
+  --hourly-input data/ghost_iot_home_hourly_1gb_cap100.jsonl \
+  --predictions outputs/ghost-iot-home-hourly-1gb-cap100 \
+  --output data/ghost_iot_home_daily_from_hourly_1gb.jsonl
+```
+
+This pairs each prediction with its hour label and builds **one JSONL record** whose `inputs[0].data` is the concatenated 24-hour pack (~26 KB). The prompt asks Newton to synthesize them into a daily narrative.
+
+### Run reduce
+
+```bash
+python 2_upload/upload_multipart.py data/ghost_iot_home_daily_from_hourly_1gb.jsonl
+
+python 3_batch_jobs/create_activity_detection_job.py \
+  --file ghost_iot_home_daily_from_hourly_1gb.jsonl \
+  --name ghost-iot-home-daily-from-hourly-1gb
+
+python 4_download_outputs/download_outputs.py <job_id> outputs/ghost-iot-home-daily-from-hourly-1gb
+python 5_view_results/view_results.py outputs/ghost-iot-home-daily-from-hourly-1gb
+```
+
+### Observed end-to-end result (1 GB source)
+
+Daily narrative produced by the reduce call:
+
+```
+### Daily Summary of Network Activity on 2019-10-19 UTC
+
+#### Overall Activity Arc:
+The network activity on October 19, 2019, throughout the day exhibited a moderate to high
+level of traffic. The activity was relatively consistent with peaks and lulls occurring
+throughout the hours. The day started with a moderate level of activity and gradually
+increased to a peak around the afternoon hours, with a slight decline in the evening...
+
+#### Dominant Protocols and Devices:
+The most dominant application protocols observed were DNS, HTTP, and HTTPS... The device
+with the highest byte count (`13d35af5c06b`) was heavily involved in HTTP and HTTPS
+traffic, suggesting it was a web browser or a device frequently accessing the internet...
+```
+
+Full pipeline wall clock ≈ **9 minutes** (40 s CSV generation, 15 s map prep, 5 s upload, 4 min map inference, 2 s reduce prep, 5 s upload, 4 min reduce inference).
+
+### Why this works at any scale
+
+| Source CSV size | Map record count | Per-map-record size | Reduce pack size |
+|---|---|---|---|
+| 1 GB (5.8M flows) | 24 | ~6.6 KB | ~26 KB |
+| 10 GB (55M flows) | 24 | ~6.6 KB | ~26 KB |
+| 100 GB (550M flows) | 24 | ~6.6 KB | ~26 KB |
+| 200 GB (1.1B flows) | 24 | ~6.6 KB | ~26 KB |
+
+Per-record size stays constant (capped by `--max-flows-per-hour`) regardless of how big the source gets. The only thing that scales is the streaming prep script's runtime — which is I/O bound and finishes in tens of seconds even at 200 GB.
+
+The tradeoff: Newton only sees a sample of each hour's flows (100 per hour × 24 = 2,400 total out of potentially billions). But the hourly *counts* in each prompt come from the full matched count, so Newton knows the scale even when it only sees a subset. Bump `--max-flows-per-hour` once you're comfortable with the platform's effective per-record limit.
+
+## 8. Scale Testing with Synthetic Data
 
 The included GHOST-IoT CSV is tiny (600 KB). To stress test the end-to-end pipeline (upload → job → download) at realistic sizes, use the synthetic generator to produce 1 GB, 10 GB, 100 GB, or 200 GB WiFi flow CSVs.
 

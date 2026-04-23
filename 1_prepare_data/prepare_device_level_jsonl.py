@@ -113,7 +113,8 @@ def main():
         fd, path = tempfile.mkstemp(prefix=f"dev_", suffix=".flows", dir=temp_dir)
         fh = os.fdopen(fd, "w")
         fh.write(FLOW_LOG_PREAMBLE + "\n\n")
-        state = {"path": path, "fh": fh, "count": 0, "first": True}
+        # count = emitted (written to temp file); matched = all involving flows
+        state = {"path": path, "fh": fh, "count": 0, "matched": 0, "first": True}
         device_state[mac] = state
         return state
 
@@ -143,6 +144,7 @@ def main():
 
                 for mac in ({mac_a, mac_b} if mac_a != mac_b else {mac_a}):
                     state = get_device(mac)
+                    state["matched"] += 1
                     if args.max_flows_per_device is not None and state["count"] >= args.max_flows_per_device:
                         continue
                     if state["first"]:
@@ -176,11 +178,22 @@ def main():
             for mac, state in devices_sorted:
                 with open(state["path"], "r") as flows_f:
                     flow_log = flows_f.read()
-                prompt = (
-                    f"Device MAC: {mac}. Date: {args.date} UTC. "
-                    f"Scope: home wlan0 interface. "
-                    f"Flow count: {state['count']} (all flows involving this device as a or b)."
-                )
+                matched = state["matched"]
+                emitted = state["count"]
+                if matched == emitted:
+                    prompt = (
+                        f"Device MAC: {mac}. Date: {args.date} UTC. "
+                        f"Scope: home wlan0 interface. "
+                        f"Flow count: {matched} (all flows involving this device as a or b)."
+                    )
+                else:
+                    prompt = (
+                        f"Device MAC: {mac}. Date: {args.date} UTC. "
+                        f"Scope: home wlan0 interface. "
+                        f"Total flows involving this device: {matched}. "
+                        f"The attached flow log contains the first {emitted} of them "
+                        f"as a representative sample (rest omitted to keep the payload in context)."
+                    )
                 record = {
                     "system": SYSTEM,
                     "instruction": INSTRUCTION,

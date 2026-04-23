@@ -73,21 +73,25 @@ def flow_row_to_line(r: dict) -> str:
     )
 
 
-def stream_filter(input_csv: str, date_str: str, max_flows: int | None):
-    """Stream the CSV, yield (flow_text_line, original_row) for rows on the target date."""
+def stream_filter(input_csv: str, date_str: str, max_flows: int | None, counts: dict):
+    """Stream the CSV, yield (flow_text_line, original_row) for rows on the target date.
+
+    counts: dict updated in place with keys 'total', 'matched', 'emitted' so the
+    caller sees the real matched-row count even when emission was capped.
+    """
     day = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     window_start = int(day.timestamp())
     window_end = int((day + timedelta(days=1)).timestamp())
 
-    total = 0
-    matched = 0
-    emitted = 0
+    counts["total"] = 0
+    counts["matched"] = 0
+    counts["emitted"] = 0
     t0 = time.time()
 
     with open(input_csv, "r") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            total += 1
+            counts["total"] += 1
             try:
                 ts = int(row["ts_start"])
             except (TypeError, ValueError, KeyError):
@@ -96,21 +100,20 @@ def stream_filter(input_csv: str, date_str: str, max_flows: int | None):
                 continue
             if not row.get("mac_a") or not row.get("mac_b"):
                 continue
-            matched += 1
-            if max_flows is not None and emitted >= max_flows:
-                # Still count remaining matched rows for accurate reporting
+            counts["matched"] += 1
+            if max_flows is not None and counts["emitted"] >= max_flows:
                 continue
             yield flow_row_to_line(row), row
-            emitted += 1
+            counts["emitted"] += 1
 
-            if total % PROGRESS_EVERY == 0:
+            if counts["total"] % PROGRESS_EVERY == 0:
                 elapsed = time.time() - t0
-                rate = total / elapsed if elapsed > 0 else 0
-                print(f"  Scanned {total:,} rows ({matched:,} matched, {emitted:,} emitted)  "
+                rate = counts["total"] / elapsed if elapsed > 0 else 0
+                print(f"  Scanned {counts['total']:,} rows ({counts['matched']:,} matched, {counts['emitted']:,} emitted)  "
                       f"{rate/1000:.0f}k rows/s  {elapsed:.1f}s")
 
     elapsed = time.time() - t0
-    print(f"  Scan complete: {total:,} total rows, {matched:,} matched, {emitted:,} emitted in {elapsed:.1f}s.")
+    print(f"  Scan complete: {counts['total']:,} total rows, {counts['matched']:,} matched, {counts['emitted']:,} emitted in {elapsed:.1f}s.")
 
 
 def main():
@@ -130,7 +133,7 @@ def main():
     print()
 
     # Pass 1 (streaming): write flow lines to a temp file. Memory stays flat.
-    flow_count = 0
+    counts = {}
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".flows", delete=False,
         dir=os.path.dirname(args.output) or None,
@@ -138,23 +141,37 @@ def main():
         tmp_path = tmp.name
         tmp.write(FLOW_LOG_PREAMBLE + "\n\n")
         first = True
-        for line, _ in stream_filter(args.input, args.date, args.max_flows):
+        for line, _ in stream_filter(args.input, args.date, args.max_flows, counts):
             if first:
                 first = False
             else:
                 tmp.write("\n")
             tmp.write(line)
-            flow_count += 1
 
+    matched_count = counts.get("matched", 0)
+    emitted_count = counts.get("emitted", 0)
     flow_log_size = os.path.getsize(tmp_path)
-    print(f"Flow log written to temp file: {fmt_bytes(flow_log_size)} ({flow_count:,} flows).")
+    print(f"Flow log written to temp file: {fmt_bytes(flow_log_size)} ({emitted_count:,} flows).")
 
-    # Build context-only prompt
-    suffix = "" if flow_count else " (No flows recorded on this date.)"
-    prompt = (
-        f"Date: {args.date} UTC. Scope: home wlan0 interface. "
-        f"Flow count: {flow_count}.{suffix}"
-    )
+    # Build context-only prompt. If we capped, disclose it so Newton knows
+    # the flow log is a sample, not the whole day.
+    if matched_count == 0:
+        prompt = (
+            f"Date: {args.date} UTC. Scope: home wlan0 interface. "
+            f"Flow count: 0. (No flows recorded on this date.)"
+        )
+    elif matched_count == emitted_count:
+        prompt = (
+            f"Date: {args.date} UTC. Scope: home wlan0 interface. "
+            f"Flow count: {matched_count}."
+        )
+    else:
+        prompt = (
+            f"Date: {args.date} UTC. Scope: home wlan0 interface. "
+            f"Total flows on this date: {matched_count}. "
+            f"The attached flow log contains the first {emitted_count} of them "
+            f"as a representative sample (rest omitted to keep the payload in context)."
+        )
 
     # Stream the temp file into the JSONL record
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
@@ -176,7 +193,7 @@ def main():
     print()
     print(f"Wrote 1 JSONL record to {args.output}")
     print(f"  prompt length : {len(prompt):,} chars")
-    print(f"  inputs[0].data: {fmt_bytes(flow_log_size)} ({flow_count:,} flows)")
+    print(f"  inputs[0].data: {fmt_bytes(flow_log_size)} ({emitted_count:,} flows emitted of {matched_count:,} matched)")
     print(f"  JSONL file    : {fmt_bytes(final_size)}")
     print()
     print("--- prompt ---")
