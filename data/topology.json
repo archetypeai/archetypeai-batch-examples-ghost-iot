@@ -1,0 +1,85 @@
+{
+  "homes": [
+    {
+      "home_id": "home_a",
+      "label": "Home A",
+      "gateway_mac": "aa1100000001",
+      "humans": [
+        {
+          "name": "Alice",
+          "devices": [
+            {"device_id": "alice_phone",  "type": "phone",  "mac": "aa1101000001"},
+            {"device_id": "alice_laptop", "type": "laptop", "mac": "aa1101000002"},
+            {"device_id": "alice_watch",  "type": "watch",  "mac": "aa1101000003"}
+          ]
+        },
+        {
+          "name": "Bob",
+          "devices": [
+            {"device_id": "bob_phone",  "type": "phone",  "mac": "aa1102000001"},
+            {"device_id": "bob_laptop", "type": "laptop", "mac": "aa1102000002"},
+            {"device_id": "bob_watch",  "type": "watch",  "mac": "aa1102000003"}
+          ]
+        }
+      ],
+      "shared_devices": [
+        {"device_id": "home_a_smart_speaker", "type": "smart_speaker", "mac": "aa1100ff0001"},
+        {"device_id": "home_a_thermostat",    "type": "thermostat",    "mac": "aa1100ff0002"}
+      ]
+    },
+    {
+      "home_id": "home_b",
+      "label": "Home B",
+      "gateway_mac": "bb2200000001",
+      "humans": [
+        {
+          "name": "Carol",
+          "devices": [
+            {"device_id": "carol_phone",  "type": "phone",  "mac": "bb2201000001"},
+            {"device_id": "carol_laptop", "type": "laptop", "mac": "bb2201000002"},
+            {"device_id": "carol_watch",  "type": "watch",  "mac": "bb2201000003"}
+          ]
+        },
+        {
+          "name": "Dan",
+          "devices": [
+            {"device_id": "dan_phone",  "type": "phone",  "mac": "bb2202000001"},
+            {"device_id": "dan_laptop", "type": "laptop", "mac": "bb2202000002"},
+            {"device_id": "dan_watch",  "type": "watch",  "mac": "bb2202000003"}
+          ]
+        }
+      ],
+      "shared_devices": [
+        {"device_id": "home_b_smart_speaker", "type": "smart_speaker", "mac": "bb2200ff0001"},
+        {"device_id": "home_b_thermostat",    "type": "thermostat",    "mac": "bb2200ff0002"}
+      ]
+    },
+    {
+      "home_id": "home_c",
+      "label": "Home C",
+      "gateway_mac": "cc3300000001",
+      "humans": [
+        {
+          "name": "Eve",
+          "devices": [
+            {"device_id": "eve_phone",  "type": "phone",  "mac": "cc3301000001"},
+            {"device_id": "eve_laptop", "type": "laptop", "mac": "cc3301000002"},
+            {"device_id": "eve_watch",  "type": "watch",  "mac": "cc3301000003"}
+          ]
+        },
+        {
+          "name": "Frank",
+          "devices": [
+            {"device_id": "frank_phone",  "type": "phone",  "mac": "cc3302000001"},
+            {"device_id": "frank_laptop", "type": "laptop", "mac": "cc3302000002"},
+            {"device_id": "frank_watch",  "type": "watch",  "mac": "cc3302000003"}
+          ]
+        }
+      ],
+      "shared_devices": [
+        {"device_id": "home_c_smart_speaker", "type": "smart_speaker", "mac": "cc3300ff0001"},
+        {"device_id": "home_c_thermostat",    "type": "thermostat",    "mac": "cc3300ff0002"}
+      ]
+    }
+  ]
+}

@@ -13,6 +13,7 @@ data/*_smoke*.csv
 data/*_smoke*.jsonl
 data/wlan0_ipv4_flows_*gb.csv
 data/wlan0_ipv4_flows_*mb.csv
+data/wifi_flows_multihome_*.csv
 
 # Large generated JSONL from stress tests (keep only the small reference ones)
 data/ghost_iot_home_*gb*.jsonl
@@ -25,3 +26,28 @@ data/ghost_iot_home_daily_*.jsonl
 data/ghost_iot_devices_daily_*.jsonl
 data/*_capped*.jsonl
 data/*_cap*.jsonl
+
+# Section 8 multi-home batch outputs (per-run state, not committed)
+data/per_device_hour/
+data/per_device_hour_*/
+data/manifest_per_device_hour*.jsonl
+data/manifest_chunked*.jsonl
+data/manifest_bucket_reduce*.jsonl
+data/manifest_device_day*.jsonl
+data/manifest_user_day*.jsonl
+data/manifest_house_day*.jsonl
+data/uploaded_file_ids*.txt
+data/uploaded_file_ids*.jsonl
+data/jobs_*.jsonl
+data/predictions_*.jsonl
+data/bucket_reduce_*.jsonl
+data/device_day_reduce*.jsonl
+data/user_day_reduce*.jsonl
+data/house_day_reduce*.jsonl
+
+# Renamed reference copies (e.g. ghost_iot_home_yesterday_v2.jsonl) used to bypass 409
+data/ghost_iot_*_yesterday_v[0-9]*.jsonl
+data/ghost_iot_*_yesterday_[0-9]*.jsonl
+
+# Stale temp files from older prep scripts
+data/tmp*.flows

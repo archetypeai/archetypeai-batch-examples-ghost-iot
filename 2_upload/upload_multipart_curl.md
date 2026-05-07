@@ -17,10 +17,16 @@ FILE="data/ghost_iot_home_yesterday.jsonl"
 FILE_SIZE=$(stat -f%z "$FILE")
 FILE_NAME=$(basename "$FILE")
 
+# NOTE: file_type is what the platform stores on the file and uses when later
+# batch jobs read it. JSONL = newline-delimited JSON → application/x-ndjson.
+# Supported types: image/jpeg, image/png, video/mp4, text/csv, text/plain,
+# application/json, application/x-ndjson. Passing text/plain or text/csv for
+# a JSONL file is the most common cause of `(item count unknown) → Processing
+# failed` later (README §10.1).
 curl -s -X POST "$BASE_URL/files/uploads/initiate" \
   -H "Authorization: Bearer $ATAI_API_KEY" \
   -H "Content-Type: application/json" \
-  -d "{\"filename\":\"$FILE_NAME\",\"file_type\":\"text/plain\",\"num_bytes\":$FILE_SIZE}" \
+  -d "{\"filename\":\"$FILE_NAME\",\"file_type\":\"application/x-ndjson\",\"num_bytes\":$FILE_SIZE}" \
   | tee /tmp/upload_init.json \
   | python3 -m json.tool
 ```

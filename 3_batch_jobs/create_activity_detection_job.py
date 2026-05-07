@@ -13,6 +13,10 @@ Usage:
     python create_activity_detection_job.py --file ghost_iot_devices_yesterday.jsonl
     python create_activity_detection_job.py --file ghost_iot_home_yesterday.jsonl --name my-run
 
+    # Section 9: many files in one batch job. Manifest is one filename per line
+    # (as written by 2_upload/upload_directory.py).
+    python create_activity_detection_job.py --file-list data/uploaded_file_ids.txt --name multihome-per-device-hour
+
 Flow:
     1. POST /v0.5/batch/jobs          -> create batch job
     2. GET  /v0.5/batch/jobs/{id}     -> poll status
@@ -20,6 +24,7 @@ Flow:
 """
 
 import argparse
+import json
 import os
 import time
 
@@ -41,13 +46,13 @@ AUTH = {"Authorization": f"Bearer {API_KEY}"}
 TERMINAL_STATUSES = {"COMPLETED", "FAILED", "CANCELLED"}
 
 
-def build_payload(file_id: str, name: str, max_new_tokens: int) -> dict:
+def build_payload(file_ids: list[str], name: str, max_new_tokens: int) -> dict:
     return {
         "name": name,
         "pipeline_type": "batch",
         "pipeline_key": "activity-detection",
         "inputs": {
-            "worker.data": [{"file_id": file_id}],
+            "worker.data": [{"file_id": fid} for fid in file_ids],
         },
         "parameters": {
             "worker": {
@@ -65,6 +70,20 @@ def build_payload(file_id: str, name: str, max_new_tokens: int) -> dict:
             }
         },
     }
+
+
+def load_file_list(path: str) -> list[str]:
+    """Read a manifest of one filename per line (blank lines and # comments ignored)."""
+    out: list[str] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            out.append(line)
+    if not out:
+        raise SystemExit(f"Manifest is empty: {path}")
+    return out
 
 
 def create_job(payload: dict) -> dict:
@@ -103,27 +122,106 @@ def default_job_name(file_id: str) -> str:
 
 def main():
     parser = argparse.ArgumentParser(description="Create an Activity Detection batch job.")
-    parser.add_argument("--file", default="ghost_iot_home_yesterday.jsonl",
-                        help="file_id (filename as registered on the platform)")
+    src = parser.add_mutually_exclusive_group()
+    src.add_argument("--file", default=None,
+                     help="Single file_id (filename as registered on the platform). "
+                          "Default: ghost_iot_home_yesterday.jsonl when neither --file nor --file-list is given.")
+    src.add_argument("--file-list", default=None,
+                     help="Path to a manifest file containing one file_id per line. "
+                          "All file_ids are bundled into a single batch job's worker.data array. "
+                          "Used by section 9 to fan out across hundreds of small JSONL inputs.")
     parser.add_argument("--name", default=None,
-                        help="Job name (default: derived from --file)")
+                        help="Job name (default: derived from --file / --file-list)")
     parser.add_argument("--poll-interval", type=int, default=10,
                         help="Seconds between status polls (default: 10)")
     parser.add_argument("--max-new-tokens", type=int, default=1024,
                         help="Maximum tokens Newton may generate per record (default: 1024). "
                              "Bump to 2048+ for reduce calls that need to synthesize multi-paragraph summaries.")
+    parser.add_argument("--filter-pattern", default=None,
+                        help="Regex applied to each filename in --file-list. Only matching entries are submitted. "
+                             "Use to skip stale entries from prior runs — e.g. --filter-pattern '__c\\d{4}\\.jsonl$' "
+                             "keeps only chunked single-record files.")
+    parser.add_argument("--max-files-per-job", type=int, default=None,
+                        help="If set, split the file list into batches of this size and create one job per batch "
+                             "(suffixed -part-NNN-of-NNN). The platform's /batch/jobs endpoint has a request-size "
+                             "limit (observed: 37K file_ids → HTTP 413 Payload Too Large). Recommended: 5000.")
     args = parser.parse_args()
 
-    name = args.name or default_job_name(args.file)
-    payload = build_payload(args.file, name, args.max_new_tokens)
+    if args.file_list:
+        file_ids = load_file_list(args.file_list)
+        if args.filter_pattern:
+            import re
+            pat = re.compile(args.filter_pattern)
+            before = len(file_ids)
+            file_ids = [f for f in file_ids if pat.search(f)]
+            print(f"Filter '{args.filter_pattern}' kept {len(file_ids)}/{before} files.")
+            if not file_ids:
+                raise SystemExit("Filter matched 0 files. Check the regex.")
+        primary = file_ids[0]
+        scope_label = f"{len(file_ids)} files via {os.path.basename(args.file_list)}"
+        derived_name = os.path.basename(args.file_list).rsplit(".", 1)[0].replace("_", "-")
+    else:
+        single = args.file or "ghost_iot_home_yesterday.jsonl"
+        file_ids = [single]
+        primary = single
+        scope_label = single
+        derived_name = default_job_name(single).removesuffix("-activity-detection")
+
+    name = args.name or f"{derived_name}-activity-detection"
 
     print("=" * 60)
     print(" Archetype AI Activity Detection Job")
     print("=" * 60)
-    print(f" file_id: {args.file}")
+    print(f" inputs:  {scope_label}")
+    if len(file_ids) > 1:
+        print(f"          first: {primary}")
+        print(f"          last:  {file_ids[-1]}")
     print(f" name:    {name}")
     print()
 
+    # Multi-job split path: too many files for one /batch/jobs POST.
+    if args.max_files_per_job and len(file_ids) > args.max_files_per_job:
+        chunks = [file_ids[i:i + args.max_files_per_job]
+                  for i in range(0, len(file_ids), args.max_files_per_job)]
+        print(f"[1/1] Splitting {len(file_ids):,} files into {len(chunks)} jobs of "
+              f"≤{args.max_files_per_job:,} each...")
+        job_summaries = []
+        repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        out_path = os.path.join(repo_dir, "data", f"jobs_{name}.jsonl")
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "w") as out_f:
+            for i, file_chunk in enumerate(chunks, 1):
+                sub_name = f"{name}-part-{i:03d}-of-{len(chunks):03d}"
+                sub_payload = build_payload(file_chunk, sub_name, args.max_new_tokens)
+                sub_job = create_job(sub_payload)
+                summary = {
+                    "job_id": sub_job["id"],
+                    "name": sub_name,
+                    "n_files": len(file_chunk),
+                    "first": file_chunk[0],
+                    "last": file_chunk[-1],
+                    "status": sub_job.get("status", "?"),
+                }
+                job_summaries.append(summary)
+                out_f.write(json.dumps(summary) + "\n")
+                print(f"  [{i:>3}/{len(chunks)}] {sub_name}  job_id={sub_job['id']}  files={len(file_chunk):,}")
+        print()
+        print("=" * 60)
+        print(f" Created {len(chunks)} jobs. Saved manifest to:")
+        print(f"   {out_path}")
+        print()
+        print(" Monitor each via the UI or:")
+        print(f"   for j in $(jq -r .job_id {out_path}); do")
+        print(f"     curl -s -H \"Authorization: Bearer $ATAI_API_KEY\" \\")
+        print(f"       \"$ATAI_API_ENDPOINT/v0.5/batch/jobs/$j\" | jq -r '.status'; done")
+        print()
+        print(" Download all outputs:")
+        print(f"   for j in $(jq -r .job_id {out_path}); do")
+        print(f"     python 4_download_outputs/download_outputs.py $j outputs/{name}; done")
+        print("=" * 60)
+        return
+
+    payload = build_payload(file_ids, name, args.max_new_tokens)
     print("[1/3] Creating activity detection job...")
     job = create_job(payload)
     job_id = job["id"]

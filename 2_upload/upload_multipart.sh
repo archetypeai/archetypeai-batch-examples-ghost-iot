@@ -22,10 +22,22 @@ FILE_SIZE=$(stat -f%z "$FILE_PATH" 2>/dev/null || stat --printf="%s" "$FILE_PATH
 
 echo "============================================================"
 echo " Archetype AI Multipart Upload (Shell)"
+# Platform-supported MIME types: image/jpeg, image/png, video/mp4, text/csv,
+# text/plain, application/json, application/x-ndjson.
+# JSONL is newline-delimited JSON → application/x-ndjson.
+case "$FILE_NAME" in
+  *.jsonl|*.ndjson) FILE_TYPE="application/x-ndjson" ;;
+  *.json)           FILE_TYPE="application/json"      ;;
+  *.csv)            FILE_TYPE="text/csv"              ;;
+  *.txt)            FILE_TYPE="text/plain"            ;;
+  *)                FILE_TYPE="text/plain"            ;;
+esac
+
 echo "============================================================"
-echo " File:     $FILE_NAME"
-echo " Size:     $(echo "$FILE_SIZE" | awk '{printf "%.2f GB", $1/1073741824}') ($FILE_SIZE bytes)"
-echo " Endpoint: $BASE_URL"
+echo " File:      $FILE_NAME"
+echo " Size:      $(echo "$FILE_SIZE" | awk '{printf "%.2f GB", $1/1073741824}') ($FILE_SIZE bytes)"
+echo " Type:      $FILE_TYPE"
+echo " Endpoint:  $BASE_URL"
 echo "============================================================"
 echo
 
@@ -35,7 +47,7 @@ echo "[1/3] Initiating upload..."
 INIT_RESPONSE=$(curl -s -X POST "$BASE_URL/files/uploads/initiate" \
   -H "Authorization: Bearer $ATAI_API_KEY" \
   -H "Content-Type: application/json" \
-  -d "{\"filename\":\"$FILE_NAME\",\"file_type\":\"text/csv\",\"num_bytes\":$FILE_SIZE}")
+  -d "{\"filename\":\"$FILE_NAME\",\"file_type\":\"$FILE_TYPE\",\"num_bytes\":$FILE_SIZE}")
 
 UPLOAD_ID=$(echo "$INIT_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['upload_id'])")
 FILE_UID=$(echo "$INIT_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['file_uid'])")

@@ -38,6 +38,28 @@ AUTH = {"Authorization": f"Bearer {API_KEY}"}
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+# Platform-supported MIME types (per /files/uploads/initiate validation):
+#   image/jpeg, image/png, video/mp4, text/csv, text/plain,
+#   application/json, application/x-ndjson
+# JSONL is newline-delimited JSON → application/x-ndjson.
+EXT_TO_FILE_TYPE = {
+    ".jsonl": "application/x-ndjson",
+    ".ndjson": "application/x-ndjson",
+    ".json":  "application/json",
+    ".csv":   "text/csv",
+    ".txt":   "text/plain",
+}
+
+
+def detect_file_type(path: str) -> str:
+    """Pick a content-type from the file extension. The platform stores this
+    on the uploaded file and uses it when later jobs read the file — getting
+    it wrong (e.g. uploading a .jsonl as text/csv) makes the batch worker fail
+    with `(item count unknown) → Processing failed`."""
+    ext = os.path.splitext(path)[1].lower()
+    return EXT_TO_FILE_TYPE.get(ext, "application/octet-stream")
+
+
 def fmt_bytes(n: int) -> str:
     if n >= 1024 ** 3:
         return f"{n / 1024**3:.2f} GB"
@@ -56,12 +78,27 @@ def progress_bar(current: int, total: int, width: int = 40) -> str:
 # ---------------------------------------------------------------------------
 # API calls
 # ---------------------------------------------------------------------------
-def initiate_upload(filename: str, file_size: int, file_type: str = "text/csv") -> dict:
+class FileAlreadyExists(Exception):
+    """Raised when /files/uploads/initiate returns HTTP 409 Conflict because
+    a file with the same filename has already been uploaded under this org.
+    The platform doesn't expose a per-file delete endpoint, so the only
+    options are: skip the re-upload (file is already there), rename the local
+    file, or use a different filename when calling initiate_upload."""
+
+    def __init__(self, filename: str, response_body: str = ""):
+        self.filename = filename
+        self.response_body = response_body
+        super().__init__(f"File already exists on platform: {filename}")
+
+
+def initiate_upload(filename: str, file_size: int, file_type: str = "application/octet-stream") -> dict:
     resp = requests.post(
         f"{BASE_URL}/files/uploads/initiate",
         headers={**AUTH, "Content-Type": "application/json"},
         json={"filename": filename, "file_type": file_type, "num_bytes": file_size},
     )
+    if resp.status_code == 409:
+        raise FileAlreadyExists(filename, resp.text)
     if not resp.ok:
         print(f"  HTTP {resp.status_code} from /files/uploads/initiate")
         print(f"  Response body: {resp.text}")
@@ -94,30 +131,67 @@ def abort_upload(upload_id: str):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <file_path>")
-        sys.exit(1)
+    import argparse
+    parser = argparse.ArgumentParser(description="Multipart upload to Archetype AI Files API.")
+    parser.add_argument("file_path", help="Local file to upload")
+    parser.add_argument("--file-type", default=None,
+                        help="Override content-type sent to /files/uploads/initiate. "
+                             "By default it's auto-detected from the file extension "
+                             "(.jsonl/.ndjson → application/x-ndjson, .json → "
+                             "application/json, .csv → text/csv, .txt → text/plain). "
+                             "Platform-supported types: image/jpeg, image/png, "
+                             "video/mp4, text/csv, text/plain, application/json, "
+                             "application/x-ndjson. Getting this wrong is the most "
+                             "common cause of `(item count unknown) → Processing "
+                             "failed` later — see README §10.1.")
+    args = parser.parse_args()
 
-    file_path = sys.argv[1]
+    file_path = args.file_path
     file_size = os.path.getsize(file_path)
     filename = os.path.basename(file_path)
+    file_type = args.file_type or detect_file_type(file_path)
 
     print(f"{'='*60}")
     print(f" Archetype AI Multipart Upload")
     print(f"{'='*60}")
-    print(f" File:     {filename}")
-    print(f" Size:     {fmt_bytes(file_size)} ({file_size:,} bytes)")
-    print(f" Endpoint: {BASE_URL}")
+    print(f" File:      {filename}")
+    print(f" Size:      {fmt_bytes(file_size)} ({file_size:,} bytes)")
+    print(f" Type:      {file_type}")
+    print(f" Endpoint:  {BASE_URL}")
     print(f"{'='*60}")
     print()
 
     # --- Step 1: Initiate ---------------------------------------------------
     print("[1/3] Initiating upload...")
-    init = initiate_upload(filename, file_size)
+    try:
+        init = initiate_upload(filename, file_size, file_type=file_type)
+    except FileAlreadyExists as exc:
+        print()
+        print(f"  File '{exc.filename}' already exists on the platform.")
+        print( "  Skipping upload — you can reference it directly in batch jobs:")
+        print(f"      python 3_batch_jobs/create_activity_detection_job.py --file {exc.filename}")
+        print()
+        print( "  If you need to upload a fresh copy, rename your local file first")
+        print( "  (the platform does not expose a per-file delete endpoint).")
+        sys.exit(0)
+
+    required = ("upload_id", "file_uid", "num_parts", "parts")
+    missing = [k for k in required if k not in init]
+    if missing:
+        print()
+        print(f"  Unexpected response shape from /files/uploads/initiate — missing field(s): {missing}")
+        print(f"  Full response body:")
+        print(f"    {json.dumps(init, indent=2)}")
+        print()
+        print( "  Likely causes: the file is in a partial-upload state on the platform")
+        print( "  (e.g. an earlier session uploaded but didn't complete), or the API has")
+        print( "  changed shape. If the file is partially uploaded, try aborting via")
+        print( "  POST /v0.5/files/uploads/{upload_id}/abort or use a different filename.")
+        sys.exit(1)
 
     upload_id = init["upload_id"]
     file_uid = init["file_uid"]
-    strategy = init["strategy"]
+    strategy = init.get("strategy", "unknown")
     num_parts = init["num_parts"]
     part_size = init.get("part_size", file_size)
     parts = init["parts"]
