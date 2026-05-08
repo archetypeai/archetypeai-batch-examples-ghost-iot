@@ -3,15 +3,17 @@
 REDUCE stage 1 (two-pass): chunk narratives -> 1 narrative per (device, hour) bucket.
 
 The dynamic-chunking prep step (prepare_per_device_hour_jsonls.py) preserves
-every flow but produces variable chunk counts per bucket (avg ~67 at 1 GB).
-Folding 67 chunk narratives into one device-hour narrative blows the C model's
-~21 KB narrative-heavy context cap, so the bucket reduce runs in TWO PASSES:
+every flow but produces variable chunk counts per bucket (avg ~40-67 at 1 GB
+depending on --max-chunk-bytes). Folding all of a bucket's chunk-narratives
+into one device-hour reduce record blows the C model's ~16-20 KB CSV-heavy
+quality cliff (§8.2, §10.7), so the bucket reduce runs in TWO PASSES:
 
   --stage a   intra-bucket pre-reduce
               For each bucket with N chunks, group chunks into packs of up to
-              --group-size (default 20). Emit ONE reduce record per group.
-              Output: bucket_reduce_a.jsonl + manifest_bucket_reduce_a.jsonl.
-              Each pack stays comfortably under the narrative cap.
+              --group-size (default 4 — sized to keep pack ≤ 13 KB given
+              ~3 KB chunk-narratives from max_new_tokens=1024). Emit ONE
+              reduce record per group. Output: bucket_reduce_a.jsonl +
+              manifest_bucket_reduce_a.jsonl.
 
   --stage b   bucket finalization
               For each bucket, fold its Stage-A partial narratives into ONE
@@ -52,8 +54,17 @@ import sys
 
 from topology import REPO_DIR, load_topology
 
-DEFAULT_GROUP_SIZE = 20
-SOFT_WARN_BYTES = 20 * 1024  # match the narrative-pack budget for the C model
+# Stage A packs N chunk-narratives per record. Each chunk-narrative is bounded
+# by max_new_tokens (default 1024 ≈ ~2.6-3 KB of text — actual narrative length
+# is generation-bounded, NOT chunk-input-bounded). Pack size = group_size ×
+# narrative_size + envelope.
+#
+# The CSV-heavy quality cliff at ~16-20 KB applies even to narrative-heavy
+# packs (the model can still degenerate when input is too long). With
+# group_size=4 and ~3 KB narratives: pack ≈ 13 KB, comfortably under cliff.
+# Don't raise without re-validating with a 5-record probe at the new size.
+DEFAULT_GROUP_SIZE = 4
+SOFT_WARN_BYTES = 16 * 1024  # narrative-pack cliff observed at ~16-20 KB (§8.2, §10.7)
 
 SYSTEM_INTRA = (
     "You are a network security analyst. The text below is a sequence of "
