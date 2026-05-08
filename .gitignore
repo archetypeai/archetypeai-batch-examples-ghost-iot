@@ -30,6 +30,8 @@ data/*_cap*.jsonl
 # Section 8 multi-home batch outputs (per-run state, not committed)
 data/per_device_hour/
 data/per_device_hour_*/
+data/multihome_chunks_*.jsonl
+data/multihome_chunks_test_*.jsonl
 data/manifest_per_device_hour*.jsonl
 data/manifest_chunked*.jsonl
 data/manifest_bucket_reduce*.jsonl

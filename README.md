@@ -544,25 +544,65 @@ File count scales linearly with source size: 1 GB ≈ 37K files, 10 GB ≈ 370K,
 
 Memory: the script keeps 576 in-flight chunk buffers (each ≤ `max_chunk_bytes`) ≈ ~6 MB RAM regardless of source size. Streaming on the input side, so any CSV size works. Each chunk file is opened, written in one shot, and closed — no concurrent file-handle pressure.
 
-#### Why the per-chunk byte cap is 10 KB (observed)
+#### Why the per-chunk byte cap is 10 KB (empirically observed)
 
-Activity Detection advertises a **16K-token model context window** (`token_budget=16,384` per the platform's `WARN inference.truncation` event when records exceed it — see §10.2). The empirical per-record GPU-memory ceiling is tighter due to activation memory and pre-allocated batch overhead. Earlier binary search at 1 GB on a single-home hourly pipeline produced:
+The 10 KB cap is binding for **two independent reasons**, both confirmed by experiment in May 2026 against `pipeline activity-detection v1.1.1-409-e749ac0`:
 
-| Per-record flow count | Per-record ~tokens | ~Bytes | Result |
+##### Reason 1: GPU memory at batch initialization (mostly fixed by `batch_size: 4`)
+
+The platform's batching engine starts at `bs=16`, periodically tries `bs=24` after several successful batches, and OOMs unrecoverably on the larger size — bisecting `bs=24 → 16 → 8 → 4 → 2 → 1` and crashing the pod when even `bs=1` doesn't fit. Per the platform team, **the C 2.5.1 model variant has a broken memory-budget calculation** that triggers this at any non-trivial chunk size; C 2.4.0 has a milder version of the same issue. See [§10.6](#106-oom-cascade-on-batch-size-escalation) for full diagnostic details and the workaround:
+
+```yaml
+worker:
+  config:
+    model_variant: newton/c:2.4.0-7b-base    # avoid the broken 2.5.1 budget
+    batch_size: 4                            # cap the engine at bs=4 (no bs=24 escalation)
+```
+
+These two settings together let chunks up to ~10 KB run cleanly through batched inference at bs=4. **Without `batch_size: 4`, the engine still escalates to bs=24 and crashes; without `model_variant: newton/c:2.4.0-7b-base`, even bs=1 fails on first allocation.**
+
+##### Reason 2: CSV-heavy quality cliff (no warning, silent garbage)
+
+Even when per-line context fits the platform's 16,384-token budget AND batch initialization succeeds, **the model degrades into table-completion mode** when the input is dominated by tabular/CSV-style data above a content-shape-dependent threshold. No warning fires; the platform reports `0 failed`; the predictions are 1-3 character fragments like `'00'`, `'|153|'`, or empty strings. This is exactly the failure mode wifi-multi observed at ~18.5 KB for `/query` ([their "Constraints driving the design"](https://github.com/archetypeai/query-examples-wifi-multi/#constraints-driving-the-design)).
+
+**Empirical sweep at 1 GB (May 2026), 5-record probe per cap, `bs=1`, `model_variant=newton/c:2.4.0-7b-base`, `max_new_tokens=1024`:**
+
+| `--max-chunk-bytes` cap | Avg `inputs[0].data` | `WARN inference.truncation`? | Output quality |
 |---|---|---|---|
-| 5000 | ~80K | ~340 KB | FAILED — pre-flight `WARN inference.truncation` + OOMKilled |
-| 1000 | ~16K | ~68 KB | FAILED — same |
-| 500 | ~8K | ~34 KB | FAILED — same |
-| 300 | ~5K | ~20 KB | FAILED — same |
-| 200 | ~3.3K | ~14 KB | FAILED — same |
-| **150** | **~2.5K** | **~10 KB** | **✓** (single-record-per-file) |
-| 100 | ~1.6K | ~7 KB | ✓ |
+| 10240 (10 KB, current default) | 10.4 KB | None | **Real narratives** ✓ |
+| 12288 (12 KB) | 12.4 KB | None | **Real narratives** ✓ |
+| 16384 (16 KB) | 16.5 KB | None | **Real narratives** ✓ (richer than 12 KB — more specific volume numbers, peak-hour observations) |
+| 20480 (20 KB) | 20.6 KB | None | ✗ Garbage (`'72\|1'`, `'0'`, `''`) |
+| 24576 (24 KB) | 24.5 KB | None | ✗ Garbage |
+| 28672 (28 KB) | 28.8 KB | None | ✗ Garbage |
+| 32768 (32 KB) | 32.7 KB | None | ✗ Garbage (`'00'`, `'801'`) |
+| 36864 (36 KB) | 37.0 KB | None | ✗ Garbage |
+| 40960 (40 KB) | 41.1 KB | **Yes — every record** | ✗ Garbage |
+| 49152 (48 KB) | 48.4 KB | Yes | ✗ Garbage |
+| 53248 (52 KB) | 53.4 KB | Yes | ✗ Garbage |
+| 55296 (54 KB) | 55.4 KB | Yes | ✗ Garbage |
+| 61440 (60 KB) | 61.6 KB | Yes | ✗ Garbage |
+| 65536 (64 KB) | 65.7 KB | Yes | ✗ Garbage |
 
-GHOST-IoT-formatted flow rows are ~65-70 bytes each (tighter than the per-row averages of typical CSV formats), so 150 flows ≈ 10 KB ≈ 2.5K tokens. The 16K context budget is *gross* of fixed activation overhead, pre-allocated max-batch-size memory, and other runtime allocations. The default `--max-chunk-bytes 10240` matches the empirical safe ceiling.
+**Two observations from this table:**
 
-**Multi-record-per-file makes this worse.** A separate UI test uploaded a 196-record JSONL (each record ~10 KB, file total 2 MB) and the platform OOMed during batch processing — bisected from `bs=16` all the way down to `bs=1` and still OOMed. The platform's pre-allocated batch memory plus per-record activations exceeded GPU budget even when each individual record was within the 10 KB safe cap. **Conclusion: keep one record per file.** The current prep script enforces this.
+1. **The truncation warning fires at ≥41 KB**, not at the much higher 16K-token estimate (~64 KB by naive `bytes/4`). The platform's tokenizer counts pipe-separated flow rows at ~0.4 tokens per byte, not the ~0.25 a generic estimate would suggest. So `inputs[0].data ≥ 41 KB` ≈ `15,360+ tokens`, exceeding the 16,384 − 1024(max_new_tokens) − ~200(prompt overhead) input ceiling.
+2. **The quality cliff sits between 16.5 KB and 20.6 KB**, well below the truncation threshold. **At ≤ 16.5 KB the model produces real narratives. At ≥ 20.6 KB it produces garbage with no warning.** The model auto-completes tabular content rather than analyzing it.
 
-**Don't raise `--max-chunk-bytes` past 10 KB without re-running the binary search.**
+##### Default `--max-chunk-bytes` rationale
+
+The proven safe range is **10 KB (default) to 16 KB (empirically validated upper bound)**. 10 KB has ~60% margin below the cliff; 16 KB sits right under it but produces meaningfully richer narratives (more specific numbers, peak-hour observations) because the model has 1.6× more flow data to work with.
+
+| Cap | Trade-off |
+|---|---|
+| `--max-chunk-bytes 10240` (default) | Safe, well-tested, 50% margin below cliff. ~150 flows / chunk. |
+| `--max-chunk-bytes 12288` | Validated empirically; richer narratives. ~180 flows / chunk. |
+| `--max-chunk-bytes 16384` | **Empirically maximum useful** — at the cliff edge, narratives are richest, but very little margin. Re-validate with a 5-record probe before committing to a long run. |
+| `--max-chunk-bytes > 16384` | **Don't.** ≥ 20 KB = silent garbage; ≥ 41 KB = explicit truncation warning. |
+
+Going beyond 16 KB requires re-running the cliff sweep — there is *zero* signal in the events log to distinguish "fits" from "garbage" until you read the prediction text.
+
+**Multi-record-per-file architecture aside.** An earlier UI test uploaded a 196-record JSONL (each record ~10 KB, file total 2 MB) and the platform OOMed during batch processing — bisected from `bs=16` all the way down to `bs=1` and still OOMed. With `batch_size: 4` (added later) the platform respects the cap and batches normally. Either architecture (one record per file × N files, or one file × N records) works as long as `batch_size: 4` is set.
 
 ### 8.3 Upload all chunk files (concurrent)
 
@@ -873,12 +913,13 @@ SUCCESS Processed 1 items (1 success, 0 failed) from <name>.jsonl
 
 **The actual failure signals are:**
 
-- `WARN inference.truncation: Batch N: M items exceed token_budget=16,384` — pre-flight warning that one or more records are over the per-record budget. Typically followed by `ERROR pod.terminated: OOMKilled` and `Status: FAILED`. See 10.2.
+- `WARN inference.truncation: Batch N: M items exceed token_budget=16,384` — pre-flight warning that one or more records are over the per-record budget. Typically followed by `ERROR pod.terminated: OOMKilled` and `Status: FAILED`. See [§10.2](#102-failed--input-over-the-per-record-token-budget).
+- `WARN inference.oom: CUDA OOM on batch 0 (16 items), recovering: splitting into 8 + 8` — engine-level OOM during batch initialization. Sometimes recovers; sometimes cascades to bs=1 and crashes the pod. See [§10.6](#106-oom-cascade-on-batch-size-escalation).
 - `ERROR pod.terminated: Container worker terminated: OOMKilled (exit=137)` — pod-level OOM, fatal. The job ends `FAILED` with `BackoffLimitExceeded`.
-- `FAILED Processing failed for <name>.jsonl` — typically wrong content-type at upload (see 10.1) or other unrecoverable file-read error.
-- Empty or 1–3-character prediction text in the downloaded output — even when the events log looks clean, always inspect at least the first prediction's text before declaring a run successful.
+- `FAILED Processing failed for <name>.jsonl` — typically wrong content-type at upload (see [§10.1](#101-completed-with-no-actual-predictions-wrong-content-type-at-upload)) or other unrecoverable file-read error.
+- **Empty or 1–3-character prediction text** in the downloaded output — **silent CSV-heavy quality cliff failure** ([§10.7](#107-csv-heavy-quality-cliff-silent-garbage-with-no-warning)). The events log will be clean and `Status: COMPLETED` — only the prediction text reveals the problem. Always read at least the first prediction.
 
-In short: **don't rely on the top-level `Status: COMPLETED`.** Read the full events log AND inspect at least the first prediction's text.
+In short: **don't rely on the top-level `Status: COMPLETED`.** Read the full events log AND inspect at least the first prediction's text. Silent failures (§10.7) are the most insidious — neither the platform's status nor the events log will warn you.
 
 ### 10.5 Output filenames don't join back to input file_ids
 
@@ -887,6 +928,127 @@ In short: **don't rely on the top-level `Status: COMPLETED`.** Read the full eve
 **Cause:** the upload manifest (`data/uploaded_file_ids.jsonl`) is missing entries for some files — typically because the section-8 directory upload skipped them via a 409 (and recorded `file_uid=""`), or you ran the batch job against files uploaded in a different session whose `file_uid`s aren't in the current manifest.
 
 **Fix:** ensure every file submitted to the batch job has its `file_uid` recorded in `data/uploaded_file_ids.jsonl`. Easiest path is to start fresh: `python cleanup.py --local --remote`, then re-run the upload step from scratch.
+
+### 10.6 OOM cascade on batch-size escalation (C 2.5.1, partial in 2.4.0)
+
+**Symptom (C 2.5.1, default model):** the very first batch OOMs at `bs=16` and bisects all the way to `bs=1` without recovering, then crashes the pod:
+
+```
+WARN   CUDA OOM on batch 0 (16 items), recovering: splitting into 8 + 8
+WARN   CUDA OOM on batch 0 (8 items), recovering: splitting into 4 + 4
+WARN   CUDA OOM on batch 0 (4 items), recovering: splitting into 2 + 2
+WARN   CUDA OOM on batch 0 (2 items), recovering: splitting into 1 + 1
+ERROR  CUDA OOM on batch 0 (1 items), cannot reduce further
+ERROR  GPU memory unrecoverable: 5 consecutive OOMs, crashing pod for restart
+```
+
+This happens even when every input line is well within `token_budget=16,384` (e.g. 10 KB / ~2.6K tokens — 16% of the budget). No `WARN inference.truncation` event fires.
+
+**Cause:** per the platform team, the C 2.5.1 memory-budget calculation is incorrect — the model overstates the GPU memory it has available. Bisection cannot recover because the platform pre-allocates batch memory based on the wrong budget.
+
+**Two-part workaround:**
+
+1. **Pin the older C 2.4.0 model variant** to avoid the broken 2.5.1 memory budget.
+2. **Set `batch_size: 4` in `parameters.worker.config`** to cap the engine's batch size and prevent the bs=24 escalation entirely.
+
+```bash
+python 3_batch_jobs/create_activity_detection_job.py \
+  --file my_chunks.jsonl \
+  --name my-job \
+  --model-variant newton/c:2.4.0-7b-base
+```
+
+You'll need to inject `batch_size: 4` directly into the payload (the `create_activity_detection_job.py` CLI doesn't expose it as a flag yet). Resulting `parameters.worker.config`:
+
+```yaml
+worker:
+  parallelism: 1
+  config:
+    generation:
+      do_sample: true
+      max_new_tokens: 1024
+      ...
+    model_variant: newton/c:2.4.0-7b-base
+    batch_size: 4
+```
+
+**Empirically validated.** A 50-record test JSONL with this exact config ran cleanly:
+
+```
+Batch 0: processed 4 items (4 success, 0 failed)
+Batch 1: processed 8 items (8 success, 0 failed)
+Batch 2: processed 12 items (12 success, 0 failed)
+... 12 batches total, 50 items, 0 OOMs ...
+Job completed in 1010s
+```
+
+**What happens without each setting:**
+
+| Config | Behavior |
+|---|---|
+| Default (C 2.5.1, no `batch_size`) | OOM cascade on batch 0, bisects to bs=1, pod crashes immediately |
+| C 2.4.0 only (no `batch_size`) | Runs through several batches at bs=16→bs=8, then trips bs=24 escalation. Sometimes recovers (24→16→8→4 ✓), sometimes doesn't (→2→1 ✗, pod crashes). Longer jobs more likely to hit unrecoverable cascade |
+| C 2.4.0 + `batch_size: 4` | **Stable**. Engine respects the cap, never escalates to bs=24, no OOM cascades |
+
+**Without `batch_size: 4`, longer jobs reliably fail.** Two ~18.5K-line jobs we ran (without the batch_size cap) failed on different bs=24 escalations:
+
+| Job | First bs=24 escalation | Outcome |
+|---|---|---|
+| `-a` | batch 9 (after 144 items) | recovered ✓ — kept running |
+| `-b` | batch 7 (after 112 items) | unrecoverable ✗ — pod crashed at bs=1 |
+
+A separate 4,627-line probe (`p4`) reached batch 35 (560 items) before tripping a fatal escalation. Failure point varies; eventual failure on long jobs without `batch_size: 4` is reliable.
+
+**This entry should partially go stale once the C 2.5.1 budget is fixed.** Re-test by dropping `--model-variant` and submitting a small job; if it runs cleanly without the OOM-at-bs=1 pattern, the C 2.5.1 fix has landed. The `batch_size: 4` cap will likely stay relevant longer (it's a defensive cap, not a workaround for a specific bug).
+
+### 10.7 CSV-heavy quality cliff (silent garbage with no warning)
+
+**Symptom:** the events log shows clean batch processing — `Batch 0: processed 1 items (1 success, 0 failed)`, `inference.completed`, no warnings — but the downloaded predictions are 1-3 character fragments:
+
+```
+[0] ''
+[1] '999'
+[2] '0'
+[3] ''
+[4] '|153|'
+```
+
+The platform reports the job as `COMPLETED` with `0 failed`. There is **no signal** in the events log that anything went wrong.
+
+**Cause:** the C model degenerates into **table-completion mode** when the input is dominated by tabular/CSV-style data above a content-shape-dependent threshold. Newton's autoregressive prediction reads "this looks like the start of a table" from the long pipe-separated flow log, and starts auto-completing more table rows instead of producing the analysis the prompt asked for. The trailing instruction (`"Analyze the attached flow log slice..."`) gets effectively ignored.
+
+This matches the [wifi-multi `/query` finding](https://github.com/archetypeai/query-examples-wifi-multi/#constraints-driving-the-design) of an ~18.5 KB CSV-heavy quality cutoff, expressed slightly differently on the batch endpoint.
+
+**Empirical sweep at 1 GB (May 2026):** see the table in §8.2. Summary:
+
+| `inputs[0].data` size | Output |
+|---|---|
+| ≤ 16.5 KB | Real narratives ✓ |
+| **16.5 – 20.6 KB (cliff zone)** | **Boundary — empirically untested in 4 KB increment, exact cutoff unknown** |
+| ≥ 20.6 KB | Garbage (table-completion mode), no warning |
+| ≥ 41 KB | Truncation warning fires + garbage |
+
+**Detection:** the only signal is the prediction text itself. **Always inspect at least the first prediction before trusting a `COMPLETED` job:**
+
+```bash
+python 4_download_outputs/download_outputs.py <job_id> outputs/<job_name>
+python -c "
+import json, glob
+for path in glob.glob('outputs/<job_name>/*.jsonl'):
+    with open(path) as f:
+        for i, line in enumerate(f):
+            pred = json.loads(line).get('prediction', '')
+            print(f'  [{i}] len={len(pred)} chars  {pred[:80]!r}')
+            if i >= 4:
+                break
+"
+```
+
+If the prediction lengths are 0–3 characters, you've crossed the cliff. Re-prep with `--max-chunk-bytes` no higher than ~12 KB.
+
+**Why no warning fires:** the model is producing tokens — the platform just doesn't second-guess what it produces. Generation completes; predictions get returned; the engine's only job is to confirm "did the worker exit cleanly?" That's why §10.4 emphasizes you must always read prediction text, not just the events log.
+
+**Fix:** use `--max-chunk-bytes 10240` (the proven default), or up to **16384** which is empirically validated and produces richer narratives. **Do not exceed 16 KB without re-running the cliff sweep** with a 5-record probe at the new size — there is no other signal that you've crossed.
 
 ## Why this design
 

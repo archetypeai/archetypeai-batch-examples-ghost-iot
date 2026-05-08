@@ -46,7 +46,19 @@ AUTH = {"Authorization": f"Bearer {API_KEY}"}
 TERMINAL_STATUSES = {"COMPLETED", "FAILED", "CANCELLED"}
 
 
-def build_payload(file_ids: list[str], name: str, max_new_tokens: int) -> dict:
+def build_payload(file_ids, name, max_new_tokens, model_variant=None):
+    config: dict = {
+        "generation": {
+            "do_sample": True,
+            "max_new_tokens": max_new_tokens,
+            "repetition_penalty": 1,
+            "temperature": 0.7,
+            "top_k": 20,
+            "top_p": 0.8,
+        },
+    }
+    if model_variant:
+        config["model_variant"] = model_variant
     return {
         "name": name,
         "pipeline_type": "batch",
@@ -57,16 +69,7 @@ def build_payload(file_ids: list[str], name: str, max_new_tokens: int) -> dict:
         "parameters": {
             "worker": {
                 "parallelism": 1,
-                "config": {
-                    "generation": {
-                        "do_sample": True,
-                        "max_new_tokens": max_new_tokens,
-                        "repetition_penalty": 1,
-                        "temperature": 0.7,
-                        "top_k": 20,
-                        "top_p": 0.8,
-                    },
-                },
+                "config": config,
             }
         },
     }
@@ -137,6 +140,11 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=1024,
                         help="Maximum tokens Newton may generate per record (default: 1024). "
                              "Bump to 2048+ for reduce calls that need to synthesize multi-paragraph summaries.")
+    parser.add_argument("--model-variant", default=None,
+                        help="Pin a specific C model variant via parameters.worker.config.model_variant. "
+                             "Example: 'newton/c:2.4.0-7b-base'. Leave unset to use the platform's default. "
+                             "Workaround for the C 2.5.1 memory-budget bug that causes OOM at bs=1 even when "
+                             "per-line context fits — see README §10.")
     parser.add_argument("--filter-pattern", default=None,
                         help="Regex applied to each filename in --file-list. Only matching entries are submitted. "
                              "Use to skip stale entries from prior runs — e.g. --filter-pattern '__c\\d{4}\\.jsonl$' "
@@ -177,6 +185,8 @@ def main():
         print(f"          first: {primary}")
         print(f"          last:  {file_ids[-1]}")
     print(f" name:    {name}")
+    if args.model_variant:
+        print(f" model:   {args.model_variant}")
     print()
 
     # Multi-job split path: too many files for one /batch/jobs POST.
@@ -192,7 +202,7 @@ def main():
         with open(out_path, "w") as out_f:
             for i, file_chunk in enumerate(chunks, 1):
                 sub_name = f"{name}-part-{i:03d}-of-{len(chunks):03d}"
-                sub_payload = build_payload(file_chunk, sub_name, args.max_new_tokens)
+                sub_payload = build_payload(file_chunk, sub_name, args.max_new_tokens, args.model_variant)
                 sub_job = create_job(sub_payload)
                 summary = {
                     "job_id": sub_job["id"],
@@ -221,7 +231,7 @@ def main():
         print("=" * 60)
         return
 
-    payload = build_payload(file_ids, name, args.max_new_tokens)
+    payload = build_payload(file_ids, name, args.max_new_tokens, args.model_variant)
     print("[1/3] Creating activity detection job...")
     job = create_job(payload)
     job_id = job["id"]
