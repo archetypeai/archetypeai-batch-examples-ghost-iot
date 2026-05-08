@@ -46,7 +46,7 @@ AUTH = {"Authorization": f"Bearer {API_KEY}"}
 TERMINAL_STATUSES = {"COMPLETED", "FAILED", "CANCELLED"}
 
 
-def build_payload(file_ids, name, max_new_tokens, model_variant=None):
+def build_payload(file_ids, name, max_new_tokens, model_variant=None, batch_size=None):
     config: dict = {
         "generation": {
             "do_sample": True,
@@ -59,6 +59,8 @@ def build_payload(file_ids, name, max_new_tokens, model_variant=None):
     }
     if model_variant:
         config["model_variant"] = model_variant
+    if batch_size is not None:
+        config["batch_size"] = batch_size
     return {
         "name": name,
         "pipeline_type": "batch",
@@ -144,7 +146,12 @@ def main():
                         help="Pin a specific C model variant via parameters.worker.config.model_variant. "
                              "Example: 'newton/c:2.4.0-7b-base'. Leave unset to use the platform's default. "
                              "Workaround for the C 2.5.1 memory-budget bug that causes OOM at bs=1 even when "
-                             "per-line context fits — see README §10.")
+                             "per-line context fits — see README §10.6.")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Cap the engine's batch size via parameters.worker.config.batch_size. "
+                             "When unset, the platform's engine starts at bs=16 and may escalate to bs=24, "
+                             "tripping unrecoverable OOM cascades on long jobs (§10.6). "
+                             "Recommended: --batch-size 4 for 10 KB chunks, --batch-size 1 for 16 KB chunks.")
     parser.add_argument("--filter-pattern", default=None,
                         help="Regex applied to each filename in --file-list. Only matching entries are submitted. "
                              "Use to skip stale entries from prior runs — e.g. --filter-pattern '__c\\d{4}\\.jsonl$' "
@@ -187,6 +194,9 @@ def main():
     print(f" name:    {name}")
     if args.model_variant:
         print(f" model:   {args.model_variant}")
+    if args.batch_size is not None:
+        print(f" bs:      {args.batch_size}")
+    print(f" tokens:  {args.max_new_tokens}")
     print()
 
     # Multi-job split path: too many files for one /batch/jobs POST.
@@ -202,7 +212,7 @@ def main():
         with open(out_path, "w") as out_f:
             for i, file_chunk in enumerate(chunks, 1):
                 sub_name = f"{name}-part-{i:03d}-of-{len(chunks):03d}"
-                sub_payload = build_payload(file_chunk, sub_name, args.max_new_tokens, args.model_variant)
+                sub_payload = build_payload(file_chunk, sub_name, args.max_new_tokens, args.model_variant, args.batch_size)
                 sub_job = create_job(sub_payload)
                 summary = {
                     "job_id": sub_job["id"],
@@ -231,7 +241,7 @@ def main():
         print("=" * 60)
         return
 
-    payload = build_payload(file_ids, name, args.max_new_tokens, args.model_variant)
+    payload = build_payload(file_ids, name, args.max_new_tokens, args.model_variant, args.batch_size)
     print("[1/3] Creating activity detection job...")
     job = create_job(payload)
     job_id = job["id"]
