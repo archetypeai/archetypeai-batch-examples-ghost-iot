@@ -549,7 +549,7 @@ The prep script streams the CSV, buckets flows by `(device_mac, hour_utc)`, and 
 
 **Why one record per file at this stage?** The chunker emits per-chunk JSONLs primarily so its sidecar manifest can use the chunk filename as a stable `file_id` (the manifest records device, hour, n_flows, ts range per chunk). Downstream we **concatenate the per-chunk files into a single multi-record JSONL and upload via multipart** rather than uploading thousands of small files — multipart at GB scale is dramatically faster and avoids per-file 409s on re-run.
 
-> **Historical note on multi-record JSONLs.** An earlier UI test uploaded a 196-record JSONL (each record ~10 KB, file total 2 MB) and the platform OOMed during batch processing — bisected from `bs=16` all the way down to `bs=1` and still OOMed (see §10.5). With `batch_size: 4` (now passed by default from `create_activity_detection_job.py`), the platform respects the cap and batches normally. **Multi-record JSONLs are now the recommended ingestion shape** as long as `batch_size: 4` is set.
+> **Historical note on multi-record JSONLs.** An earlier UI test uploaded a 196-record JSONL (each record ~10 KB, file total 2 MB) and the platform OOMed during batch processing — bisected from `bs=16` all the way down to `bs=1` and still OOMed (see §10.5). Capping the engine via `parameters.worker.config.batch_size` resolves this: pass `--batch-size 1` to `create_activity_detection_job.py` for 16 KB chunks (recommended), or `--batch-size 4` for 10 KB chunks. **Multi-record JSONLs are now the recommended ingestion shape** with the appropriate `batch_size` cap.
 
 Outputs:
 
@@ -566,18 +566,18 @@ Memory: the script keeps 576 in-flight chunk buffers (each ≤ `max_chunk_bytes`
 
 A ≤16 KB cap is binding for **two independent reasons**, both confirmed by experiment in May 2026 against `pipeline activity-detection v1.1.1-409-e749ac0`:
 
-##### Reason 1: GPU memory at batch initialization (mostly fixed by `batch_size: 4`)
+##### Reason 1: GPU memory at batch initialization (fixed by capping `batch_size`)
 
-The platform's batching engine starts at `bs=16`, periodically tries `bs=24` after several successful batches, and OOMs unrecoverably on the larger size — bisecting `bs=24 → 16 → 8 → 4 → 2 → 1` and crashing the pod when even `bs=1` doesn't fit. Per the platform team, **the C 2.5.1 model variant has a broken memory-budget calculation** that triggers this at any non-trivial chunk size; C 2.4.0 has a milder version of the same issue. See [§10.5](#105-oom-cascade-on-batch-size-escalation) for full diagnostic details and the workaround:
+The platform's batching engine starts at `bs=16`, periodically tries `bs=24` after several successful batches, and OOMs unrecoverably on the larger size — bisecting `bs=24 → 16 → 8 → 4 → 2 → 1` and crashing the pod when even `bs=1` doesn't fit. Per the platform team, **the C 2.5.1 model variant has a broken memory-budget calculation** that triggers this at any non-trivial chunk size; C 2.4.0 has a milder version of the same issue. See [§10.5](#105-oom-cascade-on-batch-size-escalation) for full diagnostic details. The fix is to cap `parameters.worker.config.batch_size` so the engine never escalates to bs=24:
 
 ```yaml
 worker:
   config:
     model_variant: newton/c:2.4.0-7b-base    # avoid the broken 2.5.1 budget
-    batch_size: 4                            # cap the engine at bs=4 (no bs=24 escalation)
+    batch_size: 1                            # we use bs=1 for 16 KB chunks (use bs=4 for ≤10 KB chunks)
 ```
 
-These two settings together let chunks up to ~16 KB run cleanly through batched inference at bs=4. **Without `batch_size: 4`, the engine still escalates to bs=24 and crashes; without `model_variant: newton/c:2.4.0-7b-base`, even bs=1 fails on first allocation.**
+These two settings together let chunks up to ~16 KB run cleanly. **`batch_size: 1` is the safe setting at our recommended 16 KB cap** — empirically validated end-to-end on the chunks job (23K records) and Stage A reduce (8K records). At smaller chunk sizes (≤10 KB) `batch_size: 4` works and is faster, but ramping bs higher at 16 KB risks the OOM cascade. The script's `--batch-size` flag exposes this directly; without it, the engine escalates to bs=24 and crashes. Without `model_variant: newton/c:2.4.0-7b-base`, even `bs=1` fails on first allocation.
 
 ##### Reason 2: CSV-heavy quality cliff (no warning, silent garbage)
 
@@ -1081,16 +1081,17 @@ This happens even when every input line is well within `token_budget=16,384` (e.
 **Two-part workaround:**
 
 1. **Pin the older C 2.4.0 model variant** to avoid the broken 2.5.1 memory budget.
-2. **Set `batch_size: 4` in `parameters.worker.config`** to cap the engine's batch size and prevent the bs=24 escalation entirely.
+2. **Cap `parameters.worker.config.batch_size`** so the engine cannot escalate to bs=24. Use **`batch_size: 1` for 16 KB chunks** (our recommended chunk cap), or **`batch_size: 4` for ≤10 KB chunks** — at smaller chunk sizes the engine can pack more items per batch without overflowing memory.
 
 ```bash
 python 3_batch_jobs/create_activity_detection_job.py \
   --file my_chunks.jsonl \
   --name my-job \
-  --model-variant newton/c:2.4.0-7b-base
+  --model-variant newton/c:2.4.0-7b-base \
+  --batch-size 1                              # 1 for 16 KB chunks, 4 for ≤10 KB
 ```
 
-You'll need to inject `batch_size: 4` directly into the payload (the `create_activity_detection_job.py` CLI doesn't expose it as a flag yet). Resulting `parameters.worker.config`:
+The `--batch-size` flag (added in commit `1b1f103`) writes through to `parameters.worker.config.batch_size`. Resulting payload:
 
 ```yaml
 worker:
@@ -1101,10 +1102,10 @@ worker:
       max_new_tokens: 1024
       ...
     model_variant: newton/c:2.4.0-7b-base
-    batch_size: 4
+    batch_size: 1   # or 4 for ≤10 KB chunks
 ```
 
-**Empirically validated.** A 50-record test JSONL with this exact config ran cleanly:
+**Empirically validated.** A 50-record test JSONL with `batch_size: 4` at ≤10 KB chunks ran cleanly:
 
 ```
 Batch 0: processed 4 items (4 success, 0 failed)
@@ -1114,24 +1115,25 @@ Batch 2: processed 12 items (12 success, 0 failed)
 Job completed in 1010s
 ```
 
-**What happens without each setting:**
+**What happens without each setting** (observations from ≤10 KB chunks with `batch_size: 4`; at 16 KB chunks we use `batch_size: 1` for additional margin):
 
 | Config | Behavior |
 |---|---|
 | Default (C 2.5.1, no `batch_size`) | OOM cascade on batch 0, bisects to bs=1, pod crashes immediately |
 | C 2.4.0 only (no `batch_size`) | Runs through several batches at bs=16→bs=8, then trips bs=24 escalation. Sometimes recovers (24→16→8→4 ✓), sometimes doesn't (→2→1 ✗, pod crashes). Longer jobs more likely to hit unrecoverable cascade |
-| C 2.4.0 + `batch_size: 4` | **Stable**. Engine respects the cap, never escalates to bs=24, no OOM cascades |
+| C 2.4.0 + `batch_size: 4` (at ≤10 KB) | **Stable**. Engine respects the cap, never escalates to bs=24, no OOM cascades |
+| C 2.4.0 + `batch_size: 1` (at 16 KB) | **Stable**. Used for all 16 KB-chunk jobs in this repo end-to-end (chunks, Stage A, Stage B, etc.) |
 
-**Without `batch_size: 4`, longer jobs reliably fail.** Two ~18.5K-line jobs we ran (without the batch_size cap) failed on different bs=24 escalations:
+**Without a `batch_size` cap, longer jobs reliably fail.** Two ~18.5K-line jobs we ran at ≤10 KB chunks (without the cap) failed on different bs=24 escalations:
 
 | Job | First bs=24 escalation | Outcome |
 |---|---|---|
 | `-a` | batch 9 (after 144 items) | recovered ✓ — kept running |
 | `-b` | batch 7 (after 112 items) | unrecoverable ✗ — pod crashed at bs=1 |
 
-A separate 4,627-line probe (`p4`) reached batch 35 (560 items) before tripping a fatal escalation. Failure point varies; eventual failure on long jobs without `batch_size: 4` is reliable.
+A separate 4,627-line probe (`p4`) reached batch 35 (560 items) before tripping a fatal escalation. Failure point varies; eventual failure on long jobs without a `batch_size` cap is reliable.
 
-**This entry should partially go stale once the C 2.5.1 budget is fixed.** Re-test by dropping `--model-variant` and submitting a small job; if it runs cleanly without the OOM-at-bs=1 pattern, the C 2.5.1 fix has landed. The `batch_size: 4` cap will likely stay relevant longer (it's a defensive cap, not a workaround for a specific bug).
+**This entry should partially go stale once the C 2.5.1 budget is fixed.** Re-test by dropping `--model-variant` and submitting a small job; if it runs cleanly without the OOM-at-bs=1 pattern, the C 2.5.1 fix has landed. The `batch_size` cap (currently `1` for 16 KB chunks, `4` for ≤10 KB) will likely stay relevant longer — it's a defensive cap, not a workaround for a specific bug.
 
 ### 10.6 CSV-heavy quality cliff (silent garbage with no warning)
 
