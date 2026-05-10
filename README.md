@@ -460,7 +460,7 @@ The single-record approach in sections 2–6 fits in context only for the small 
 
 This section's **multi-home batch pattern** solves both problems at once:
 
-- **Context fit:** chunk the input dynamically — for each `(device, hour)` bucket, pack flow rows into chunks until each chunk hits the byte budget, then close it and start a new chunk. **No flows are dropped** — high-volume buckets simply produce more chunks. At 1 GB the chunk batch processes ~38K independent inferences across 576 multi-record JSONL files.
+- **Context fit:** chunk the input dynamically — for each `(device, hour)` bucket, pack flow rows into chunks until each chunk hits the byte budget, then close it and start a new chunk. **No flows are dropped** — high-volume buckets simply produce more chunks. At 1 GB the chunk batch processes **23,249 independent inferences** at the validated `--max-chunk-bytes 16384` (~4K tokens / chunk) — or ~38K at the older default of 10 KB. The 576 device-hour buckets stay constant (24 devices × 24 hours); only the chunks-per-bucket count varies with flow volume.
 - **Multi-tenant scope:** model a realistic deployment with multiple homes, multiple humans per home, and a mix of personal and shared devices. Five follow-up reduce jobs (bucket-A → bucket-B → device-day → user-day + house-day) fold the chunks back into per-device, per-user, and per-house daily summaries.
 - **Throughput — 2 GPU nodes:** the org's batch-job concurrency is ≥2 (confirmed: pairs of jobs run RUNNING simultaneously). Every batch in this section is split into **two positional halves** (`_a1` / `_a2`, `_h1` / `_h2`, etc.) and submitted as two independent jobs so both GPU nodes stay saturated. Splits are positional (lines `[0:N/2]` and `[N/2:]`, no shuffle), so the post-job join is trivially `cat a1_output a2_output` — positionally aligned with the single source manifest, no content-key remap needed. This roughly halves wall-clock at zero quality cost: the chunks batch (23K records at 16 KB cap) finished in ~46h split vs. an extrapolated ~62h single-job; Stage A (~8K records, group-size 3) targets ~7–9h split vs. ~13–18h single-job.
 
@@ -902,7 +902,7 @@ python 5_view_results/view_results.py outputs/multihome-house-day --manifest dat
 | User-day reduce | 6 | ~3 KB | 3 × device-day narrative length |
 | House-day reduce | 3 | ~8 KB | 8 × device-day narrative length |
 
-Chunk count scales linearly with source size: at 1 GB ≈ 5.8M flows / 150 flows-per-chunk ≈ 38K chunks; at 10 GB ≈ 380K. The pipeline's *structure* (576 device-hour buckets, 24 device-day records, 6+3 user/house-day records) stays identical at any scale — only stage 1's chunk count grows.
+Chunk count scales linearly with source size. At the default 10 KB cap (~150 flows/chunk): 1 GB ≈ 38K chunks, 10 GB ≈ 380K. At the validated 16 KB cap (~250 flows/chunk): 1 GB ≈ 23K chunks, 10 GB ≈ 230K. The pipeline's *structure* (576 device-hour buckets, 24 device-day records, 6+3 user/house-day records) stays identical at any scale — only stage 1's chunk count grows.
 
 **No sampling, no truncation:** every flow in the source CSV ends up in exactly one chunk; chunk narratives are folded losslessly through Stages A/B into one device-hour narrative. Stages 3-4 then summarize across hours, devices, users, and homes.
 
@@ -942,7 +942,7 @@ End-to-end is **GPU-bound on the main chunk batch**. Numbers below come from an 
 
 ## 9. Cleanup between runs
 
-A full section-8 run leaves several gigabytes of generated artifacts on disk — synthetic CSVs, ~38K chunk JSONLs, manifests, predictions, downloaded outputs. The Files API also keeps every uploaded filename indefinitely, so re-running the same pipeline trips a 409 Conflict on the second upload of any file with the same name. `cleanup.py` at the repo root handles both.
+A full section-8 run leaves several gigabytes of generated artifacts on disk — synthetic CSVs, ~23K–38K chunk JSONLs (depending on `--max-chunk-bytes`), manifests, predictions, downloaded outputs. The Files API also keeps every uploaded filename indefinitely, so re-running the same pipeline trips a 409 Conflict on the second upload of any file with the same name. `cleanup.py` at the repo root handles both.
 
 ```bash
 # Dry-run (default) — list everything that WOULD be deleted, touch nothing
