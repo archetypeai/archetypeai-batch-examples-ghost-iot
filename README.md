@@ -26,30 +26,36 @@ CSV flows ──┬─► prepare_home_level_jsonl.py     ─► ghost_iot_home_
                           natural-language narratives
 ```
 
-**Multi-home batch pattern** — required for GB-scale inputs and multi-tenant deployments (multiple homes, humans per home, devices per human). Streaming dynamic chunking preserves every flow; **one record per file** (≤10 KB) so every upload is an independent inference unit, mirroring [wifi-multi's `/query` design](https://github.com/archetypeai/archetypeai-query-examples-wifi-multi/#constraints-driving-the-design). Six batch jobs (chunk → bucket-A → bucket-B → device-day → user-day + house-day) fold the chunks back into per-device, per-user, and per-house daily narratives. Used in [section 8](#8-multi-home-batch-with-many-small-files).
+**Multi-home batch pattern** — required for GB-scale inputs and multi-tenant deployments (multiple homes, humans per home, devices per human). Streaming dynamic chunking preserves every flow into ≤16 KB / ~4K-token chunks (the empirically validated upper bound — §10.6). Chunks are concatenated into a single multi-record JSONL, **split positionally in half**, and uploaded as two files via multipart so two batch jobs can run in parallel on both available GPU nodes. Six logical batch stages (chunk → bucket-A → bucket-B → device-day → user-day + house-day) fold the chunks back into per-device, per-user, and per-house daily narratives — each stage is split into two parallel jobs. Used in [section 8](#8-multi-home-batch-with-many-small-files).
 
 ```
 multi-home CSV
-   │ prepare_per_device_hour_jsonls.py   (dynamic chunking, ≤10 KB / chunk, no sampling)
+   │ prepare_per_device_hour_jsonls.py   (dynamic chunking, ≤16 KB / ~4K tokens per chunk — §10.6; no sampling)
    ▼
-~37K single-record JSONLs in data/per_device_hour/  + sidecar manifest
-   │ upload_directory.py --concurrency 8
+data/per_device_hour/  (one tiny JSONL per chunk) + sidecar manifest
+   │ cat → 1 multi-record JSONL → positional split into halves
    ▼
-~37K file_ids → Activity Detection batch job (worker.data = ~37K file_ids)
-   │ extract_predictions.py
+data/multihome_chunks_h1.jsonl  +  data/multihome_chunks_h2.jsonl
+   │ upload_multipart.py × 2  (parallel)
    ▼
-~37K chunk-slice narratives
-   │ prepare_bucket_reduce.py --stage a   (group ≤20 chunks per pack)
+2 file_uids
+   │ create_activity_detection_job.py --file <half>  × 2  (run on 2 GPUs in parallel)
    ▼
-~1700 partial narratives → batch job
+outputs/h1 + outputs/h2  →  cat (in order)  →  data/predictions_chunks.jsonl
+   │ join to manifest by content key (device_id + hour + n_flows + ts_lo + ts_hi + n_bytes — §10.7)
+   ▼
+chunk-slice narratives keyed by manifest file_id
+   │ prepare_bucket_reduce.py --stage a   (`--group-size 3` — our cliff-safe default in this repo; script default is 4 — §8.6)
+   ▼
+~7,950 partials at group-size 3 → split in 2 → 2 batch jobs
    │ prepare_bucket_reduce.py --stage b   (1 record per (device, hour))
    ▼
-576 device-hour narratives → batch job
+576 device-hour narratives → split in 2 → 2 batch jobs
    │ prepare_device_day_reduce.py
    ▼
-24 device-day narratives → batch job
-   ├─► prepare_user_day_reduce.py  ─►  6 user-day narratives
-   └─► prepare_house_day_reduce.py ─►  3 house-day narratives
+24 device-day narratives → split in 2 → 2 batch jobs
+   ├─► prepare_user_day_reduce.py  ─►  6 user-day narratives (1 batch job — too small to split usefully)
+   └─► prepare_house_day_reduce.py ─►  3 house-day narratives (1 batch job)
 ```
 
 | Step | Script | Description |
@@ -59,11 +65,11 @@ multi-home CSV
 | Chunk prep | `1_prepare_data/prepare_per_device_hour_jsonls.py` | Greedy size-based chunking — every flow preserved, one chunk per single-record JSONL file (~37K files at 1 GB) |
 | Bucket reduce | `1_prepare_data/prepare_bucket_reduce.py --stage {a,b}` | Two-pass fold: chunks → partials → 1 narrative per (device, hour) |
 | Device/user/house reduce | `1_prepare_data/prepare_{device,user,house}_day_reduce.py` | Fold device-hour → device-day → {user-day, house-day} |
-| Upload (single) | `2_upload/upload_multipart.py` | Multipart presigned-URL upload, one file |
-| Upload (directory) | `2_upload/upload_directory.py` | Concurrent bulk-upload of a directory of JSONLs, idempotent |
-| Batch job | `3_batch_jobs/create_activity_detection_job.py` | Create & monitor; supports `--file` or `--file-list` |
+| Concat + split | `cat` + Python one-liner | Concatenate per-chunk JSONLs into one multi-record file, then positionally split into two halves for 2-GPU parallelism (§8.3) |
+| Upload | `2_upload/upload_multipart.py` | Multipart presigned-URL upload of one large file (run twice in parallel, once per half) |
+| Batch job | `3_batch_jobs/create_activity_detection_job.py` | Create & monitor a single-file job; run twice in parallel (`--file <h1>` and `--file <h2>`) for 2-GPU concurrency |
 | Download | `4_download_outputs/download_outputs.py` | Paginated download of prediction files |
-| Join predictions | `4_download_outputs/extract_predictions.py` | Map output filenames back to input file_ids via upload manifest |
+| Join predictions | Python one-liner | Concatenate the two output JSONLs in order, then join to the source manifest by content key (§10.7) — no separate join script needed |
 | View | `5_view_results/view_results.py` | Pretty-print outputs; `--manifest` mode labels by topology scope |
 
 ## Dataset
@@ -456,6 +462,7 @@ This section's **multi-home batch pattern** solves both problems at once:
 
 - **Context fit:** chunk the input dynamically — for each `(device, hour)` bucket, pack flow rows into chunks until each chunk hits the byte budget, then close it and start a new chunk. **No flows are dropped** — high-volume buckets simply produce more chunks. At 1 GB the chunk batch processes ~38K independent inferences across 576 multi-record JSONL files.
 - **Multi-tenant scope:** model a realistic deployment with multiple homes, multiple humans per home, and a mix of personal and shared devices. Five follow-up reduce jobs (bucket-A → bucket-B → device-day → user-day + house-day) fold the chunks back into per-device, per-user, and per-house daily summaries.
+- **Throughput — 2 GPU nodes:** the org's batch-job concurrency is ≥2 (confirmed: pairs of jobs run RUNNING simultaneously). Every batch in this section is split into **two positional halves** (`_a1` / `_a2`, `_h1` / `_h2`, etc.) and submitted as two independent jobs so both GPU nodes stay saturated. Splits are positional (lines `[0:N/2]` and `[N/2:]`, no shuffle), so the post-job join is trivially `cat a1_output a2_output` — positionally aligned with the single source manifest, no content-key remap needed. This roughly halves wall-clock at zero quality cost: the chunks batch (23K records at 16 KB cap) finished in ~46h split vs. an extrapolated ~62h single-job; Stage A (~8K records, group-size 3) targets ~7–9h split vs. ~13–18h single-job.
 
 The pattern is adapted from the [wifi-multi `/query` demo](https://github.com/archetypeai/archetypeai-query-examples-wifi-multi) — same topology, same prompt structure — but rebuilt around the **batch jobs + Files API** instead of the synchronous `/query` endpoint. The batch pattern's selling point: independent of source CSV size (1 MB, 1 GB, or 200 GB), the prep step always emits 576 files, each fitting Activity Detection's per-record context budget.
 
@@ -468,32 +475,40 @@ back to one narrative per `(device, hour)` via a two-pass bucket reduce.
 ```
 1 GB multi-home CSV (5.8M flows, 24 devices × 24 hours of data)
          │
-         ▼  prepare_per_device_hour_jsonls.py  (dynamic chunking, ≤10 KB / chunk)
-~37K single-record JSONLs in data/per_device_hour/  (one chunk per file)
-+ data/manifest_chunked.jsonl  (one entry per chunk file)
+         ▼  prepare_per_device_hour_jsonls.py  (dynamic chunking, ≤16 KB / chunk ≈ ≤4K tokens — validated upper bound, see §10.6)
+data/per_device_hour/  (~23K single-record JSONLs at 16 KB cap)
++ data/manifest_chunked.jsonl  (one entry per chunk file, in chunker-emit order)
          │
-         ▼  upload_directory.py --concurrency 8 → Files API
-~37K file_ids → Activity Detection batch job (worker.data = ~37K file_ids)
+         ▼  cat per_device_hour/*.jsonl > multihome_chunks.jsonl   (one multi-record JSONL, no shuffle)
+         ▼  positional split: head -n N/2  →  _h1.jsonl    /    tail  →  _h2.jsonl
+data/multihome_chunks_h1.jsonl  +  data/multihome_chunks_h2.jsonl   (≈11.6K records each at 1 GB / 16 KB cap)
          │
-         ▼  ~37K chunk-slice narratives, downloaded + joined by extract_predictions.py
-data/predictions_chunked.jsonl
+         ▼  upload_multipart.py × 2 (parallel)
+         ▼  create_activity_detection_job.py --file <half>  × 2 (run on 2 GPU nodes in parallel — org concurrency ≥2)
+outputs/h1/output_*.jsonl  +  outputs/h2/output_*.jsonl
          │
-         ▼  prepare_bucket_reduce.py --stage a   (group chunks → ≤20 chunks per pack)
-data/bucket_reduce_a.jsonl  (~1700 records at 1 GB) → batch job
+         ▼  cat outputs/h1/* outputs/h2/* > data/predictions_chunks.jsonl   (concat in order)
+         ▼  content-key join to manifest_chunked.jsonl (§10.7)   →   predictions keyed by file_id
+         │
+         ▼  prepare_bucket_reduce.py --stage a   (group ≤4 chunks per pack, default; drop to 3 if cliff warning fires)
+data/bucket_reduce_a.jsonl  (~5,800 at group-size 4 / ~7,950 at group-size 3)
+         │
+         ▼  positional split + upload × 2 + create_activity_detection_job × 2  (2 GPUs in parallel)
+         ▼  cat outputs → predictions_bucket_reduce_a.jsonl   (positional join — we control the split, no shuffle)
          │
          ▼  prepare_bucket_reduce.py --stage b   (1 record per (device, hour))
-data/bucket_reduce_b.jsonl  (576 records) → batch job
+data/bucket_reduce_b.jsonl  (576 records)  →  split × 2 → 2 batch jobs → cat outputs
          │
          ▼  576 device-hour narratives + manifest_per_device_hour.jsonl
          │
          ▼  prepare_device_day_reduce.py  (group by device)
-1 JSONL × 24 records → batch job → 24 device-day narratives
+1 JSONL × 24 records  →  split × 2 → 2 batch jobs → cat outputs  →  24 device-day narratives
          │
          ├─►  prepare_user_day_reduce.py   (group by human, personal devices only)
-         │    1 JSONL × 6 records → batch job → 6 user-day narratives
+         │    1 JSONL × 6 records → 1 batch job → 6 user-day narratives  (too small to split usefully)
          │
          └─►  prepare_house_day_reduce.py  (group by home, all devices)
-              1 JSONL × 3 records → batch job → 3 house-day narratives
+              1 JSONL × 3 records → 1 batch job → 3 house-day narratives
 ```
 
 ### Topology
@@ -531,7 +546,9 @@ python 1_prepare_data/prepare_per_device_hour_jsonls.py \
 
 The prep script streams the CSV, buckets flows by `(device_mac, hour_utc)`, and packs each bucket's flows into chunks using **greedy size-based fill**: append flow rows to a chunk until the chunk's flow-log payload approaches `--max-chunk-bytes` (default 10 KB ≈ 150 GHOST-IoT-formatted flow rows ≈ 2.5K tokens), then close the chunk and write it to **its own single-record JSONL file**. **No flows are dropped — every row in the source ends up in exactly one chunk.** A 12,345-flow bucket produces ~83 separate JSONL files (chunks 0–82), each ≤10 KB.
 
-**Why one record per file, not many records per file?** The platform's batch worker treats each input file as an independent inference unit. Multi-record JSONLs trigger CUDA OOM with batch-size bisection that cannot recover (observed at 2 MB / 196 records, where `bs=16→8→4→2→1` all OOMed and the pod was crashed for restart). Mirroring [wifi-multi's `/query` design](https://github.com/archetypeai/archetypeai-query-examples-wifi-multi/#constraints-driving-the-design) — one independent unit per call — sidesteps the issue.
+**Why one record per file at this stage?** The chunker emits per-chunk JSONLs primarily so its sidecar manifest can use the chunk filename as a stable `file_id` (the manifest records device, hour, n_flows, ts range per chunk). Downstream we **concatenate the per-chunk files into a single multi-record JSONL and upload via multipart** rather than uploading thousands of small files — multipart at GB scale is dramatically faster and avoids per-file 409s on re-run.
+
+> **Historical note on multi-record JSONLs.** An earlier UI test uploaded a 196-record JSONL (each record ~10 KB, file total 2 MB) and the platform OOMed during batch processing — bisected from `bs=16` all the way down to `bs=1` and still OOMed (see §10.5). With `batch_size: 4` (now passed by default from `create_activity_detection_job.py`), the platform respects the cap and batches normally. **Multi-record JSONLs are now the recommended ingestion shape** as long as `batch_size: 4` is set.
 
 Outputs:
 
@@ -550,7 +567,7 @@ The 10 KB cap is binding for **two independent reasons**, both confirmed by expe
 
 ##### Reason 1: GPU memory at batch initialization (mostly fixed by `batch_size: 4`)
 
-The platform's batching engine starts at `bs=16`, periodically tries `bs=24` after several successful batches, and OOMs unrecoverably on the larger size — bisecting `bs=24 → 16 → 8 → 4 → 2 → 1` and crashing the pod when even `bs=1` doesn't fit. Per the platform team, **the C 2.5.1 model variant has a broken memory-budget calculation** that triggers this at any non-trivial chunk size; C 2.4.0 has a milder version of the same issue. See [§10.6](#106-oom-cascade-on-batch-size-escalation) for full diagnostic details and the workaround:
+The platform's batching engine starts at `bs=16`, periodically tries `bs=24` after several successful batches, and OOMs unrecoverably on the larger size — bisecting `bs=24 → 16 → 8 → 4 → 2 → 1` and crashing the pod when even `bs=1` doesn't fit. Per the platform team, **the C 2.5.1 model variant has a broken memory-budget calculation** that triggers this at any non-trivial chunk size; C 2.4.0 has a milder version of the same issue. See [§10.5](#105-oom-cascade-on-batch-size-escalation) for full diagnostic details and the workaround:
 
 ```yaml
 worker:
@@ -567,22 +584,24 @@ Even when per-line context fits the platform's 16,384-token budget AND batch ini
 
 **Empirical sweep at 1 GB (May 2026), 5-record probe per cap, `bs=1`, `model_variant=newton/c:2.4.0-7b-base`, `max_new_tokens=1024`:**
 
-| `--max-chunk-bytes` cap | Avg `inputs[0].data` | `WARN inference.truncation`? | Output quality |
-|---|---|---|---|
-| 10240 (10 KB, current default) | 10.4 KB | None | **Real narratives** ✓ |
-| 12288 (12 KB) | 12.4 KB | None | **Real narratives** ✓ |
-| 16384 (16 KB) | 16.5 KB | None | **Real narratives** ✓ (richer than 12 KB — more specific volume numbers, peak-hour observations) |
-| 20480 (20 KB) | 20.6 KB | None | ✗ Garbage (`'72\|1'`, `'0'`, `''`) |
-| 24576 (24 KB) | 24.5 KB | None | ✗ Garbage |
-| 28672 (28 KB) | 28.8 KB | None | ✗ Garbage |
-| 32768 (32 KB) | 32.7 KB | None | ✗ Garbage (`'00'`, `'801'`) |
-| 36864 (36 KB) | 37.0 KB | None | ✗ Garbage |
-| 40960 (40 KB) | 41.1 KB | **Yes — every record** | ✗ Garbage |
-| 49152 (48 KB) | 48.4 KB | Yes | ✗ Garbage |
-| 53248 (52 KB) | 53.4 KB | Yes | ✗ Garbage |
-| 55296 (54 KB) | 55.4 KB | Yes | ✗ Garbage |
-| 61440 (60 KB) | 61.6 KB | Yes | ✗ Garbage |
-| 65536 (64 KB) | 65.7 KB | Yes | ✗ Garbage |
+| `--max-chunk-bytes` cap | Avg `inputs[0].data` | ~Tokens (data)¹ | `WARN inference.truncation`? | Output quality |
+|---|---|---|---|---|
+| 10240 (10 KB, current default) | 10.4 KB | ~2.5k | None | **Real narratives** ✓ |
+| 12288 (12 KB) | 12.4 KB | ~3k | None | **Real narratives** ✓ |
+| 16384 (16 KB) | 16.5 KB | **~4k** (last good) | None | **Real narratives** ✓ (richer than 12 KB — more specific volume numbers, peak-hour observations) |
+| 20480 (20 KB) | 20.6 KB | ~5k | None | ✗ Garbage (`'72\|1'`, `'0'`, `''`) |
+| 24576 (24 KB) | 24.5 KB | ~6k | None | ✗ Garbage |
+| 28672 (28 KB) | 28.8 KB | ~7k | None | ✗ Garbage |
+| 32768 (32 KB) | 32.7 KB | ~8k | None | ✗ Garbage (`'00'`, `'801'`) |
+| 36864 (36 KB) | 37.0 KB | ~9k | None | ✗ Garbage |
+| 40960 (40 KB) | 41.1 KB | ~10k | **Yes — every record** | ✗ Garbage |
+| 49152 (48 KB) | 48.4 KB | ~12k | Yes | ✗ Garbage |
+| 53248 (52 KB) | 53.4 KB | ~13k | Yes | ✗ Garbage |
+| 55296 (54 KB) | 55.4 KB | ~14k | Yes | ✗ Garbage |
+| 61440 (60 KB) | 61.6 KB | ~15k | Yes | ✗ Garbage |
+| 65536 (64 KB) | 65.7 KB | ~16k | Yes | ✗ Garbage |
+
+¹ **Tokens column uses ~0.25 tok/byte** (generic 4 chars/token), which matches the quality cliff — empirically, **~4k tokens of flow data is the last good size**. The platform's own tokenizer for pipe-separated flow rows is denser (~0.4 tok/byte), and that's what drives the *truncation* cliff at ~41 KB (~16k tokens of actual context spend, exceeding the 16,384 ctx − 1024 out − ~200 prompt budget — see observation 1 below). The two cliffs are independent: the **quality cliff** (~4k tokens / 16 KB) is a small-model coherence limit and fires silently; the **truncation cliff** (~16k tokens / 41 KB) is a context-length limit and emits a warning.
 
 **Two observations from this table:**
 
@@ -604,132 +623,257 @@ Going beyond 16 KB requires re-running the cliff sweep — there is *zero* signa
 
 **Multi-record-per-file architecture aside.** An earlier UI test uploaded a 196-record JSONL (each record ~10 KB, file total 2 MB) and the platform OOMed during batch processing — bisected from `bs=16` all the way down to `bs=1` and still OOMed. With `batch_size: 4` (added later) the platform respects the cap and batches normally. Either architecture (one record per file × N files, or one file × N records) works as long as `batch_size: 4` is set.
 
-### 8.3 Upload all chunk files (concurrent)
+### 8.3 Concat per-chunk JSONLs, split positionally, upload both halves
 
 ```bash
-python 2_upload/upload_directory.py data/per_device_hour --concurrency 8
-# manifest goes to data/uploaded_file_ids.txt by default
-# sibling data/uploaded_file_ids.jsonl records {filename, file_uid} for the post-download join
+# 1. Concatenate ~23K per-chunk JSONLs into one multi-record file (no shuffle — keeps positional alignment with the sidecar manifest)
+cat data/per_device_hour/*.jsonl > data/multihome_chunks.jsonl
+# At 1 GB / 16 KB cap this produces ~23K lines in one file (~400 MB).
+
+# 2. Positional split into two halves (no shuffle)
+./myenv/bin/python <<'PY'
+with open("data/multihome_chunks.jsonl") as f: lines = f.readlines()
+mid = len(lines) // 2
+open("data/multihome_chunks_h1.jsonl", "w").writelines(lines[:mid])
+open("data/multihome_chunks_h2.jsonl", "w").writelines(lines[mid:])
+PY
+
+# 3. Upload both halves in parallel — multipart presigned-URL upload
+python 2_upload/upload_multipart.py data/multihome_chunks_h1.jsonl &
+python 2_upload/upload_multipart.py data/multihome_chunks_h2.jsonl &
+wait
 ```
 
-37K sequential uploads at ~1–2 s each would be 10–20 hours, so the script uploads in parallel via a thread pool. **Default `--concurrency 8`** brings 1 GB down to ~1–2 hours; bump higher (16, 32) if the platform tolerates it. Idempotent: if the manifest already lists a filename, that file is skipped. Re-run after a partial network failure (or ctrl-C) to pick up where it left off.
+**Why concat + split + multipart instead of uploading 23K small files?**
+- Multipart upload of two ~200 MB files saturates the API far better than thousands of sequential ~17 KB PUTs. Empirically the multipart path completes in ~1–2 minutes per half; the equivalent directory upload took 1–2 hours.
+- The split is **positional** (no shuffle), which keeps `multihome_chunks_h1[i]` aligned with `manifest_chunked[i]` for `i < N/2` and `multihome_chunks_h2[j]` aligned with `manifest_chunked[N/2 + j]`. Post-download join is then a trivial concat in the same order (§8.5).
+- **2 GPU nodes in parallel.** The org's batch-job concurrency is ≥2, so two single-file jobs run simultaneously on two GPU nodes and halve wall-clock at no quality cost (see [§8 intro](#8-multi-home-batch-with-many-small-files) — bullet 3, and the wall-clock table below).
 
-### 8.4 Run the main chunk batch job
+### 8.4 Run the main chunk batch — two jobs in parallel
 
 ```bash
 python 3_batch_jobs/create_activity_detection_job.py \
-  --file-list data/uploaded_file_ids.txt \
-  --name multihome-chunked
+  --file multihome_chunks_h1.jsonl \
+  --name multihome-chunks-h1 \
+  --model-variant newton/c:2.4.0-7b-base \
+  --batch-size 1 \
+  --max-new-tokens 1024 \
+  --poll-interval 300 &
+
+python 3_batch_jobs/create_activity_detection_job.py \
+  --file multihome_chunks_h2.jsonl \
+  --name multihome-chunks-h2 \
+  --model-variant newton/c:2.4.0-7b-base \
+  --batch-size 1 \
+  --max-new-tokens 1024 \
+  --poll-interval 300 &
 ```
 
-`worker.data` is a ~37,000-element array of `{"file_id": <filename>}` at 1 GB, with each input file containing exactly one chunk record. The platform processes each file as an independent inference. **Caveat:** if the `/v0.5/batch/jobs` endpoint enforces a request-size limit, you may need to split the manifest into multiple jobs (e.g. four sub-jobs of ~9K files each) — the current code submits everything in one call.
+Both jobs use `--file` (single multi-record JSONL per job). The platform reads the file once and treats each line as one inference. Per-record output is keyed by `line_index` (0..N/2 within each half). At 1 GB / 16 KB cap each half is ~11.6K records.
 
-### 8.5 Download and join chunk predictions
+### 8.5 Download both halves, concat in order, join to manifest
 
 ```bash
-python 4_download_outputs/download_outputs.py <main_job_id> outputs/multihome-chunked
-python 4_download_outputs/extract_predictions.py outputs/multihome-chunked \
-  --upload-manifest data/uploaded_file_ids.jsonl \
-  --output data/predictions_chunked.jsonl
+python 4_download_outputs/download_outputs.py <h1_job_id> outputs/multihome-chunks-h1
+python 4_download_outputs/download_outputs.py <h2_job_id> outputs/multihome-chunks-h2
+
+# Concat in order (h1 first, h2 second — preserves positional alignment with manifest_chunked.jsonl)
+cat outputs/multihome-chunks-h1/output_*.jsonl \
+    outputs/multihome-chunks-h2/output_*.jsonl \
+  > data/predictions_chunks_raw.jsonl
 ```
 
-`extract_predictions.py` parses each `inp_<HASH>_output.jsonl` filename, looks `<HASH>` up in the upload manifest's `file_uid` column, and emits one record per `(file_id, line_index)` pair — preserving the chunk-index ordering. ~38K predictions at 1 GB.
+If the per-chunk JSONLs were concatenated **without** shuffling in §8.3, the positional join holds: `predictions_chunks_raw.jsonl[i]` corresponds to `manifest_chunked[i]`. If you (or an earlier session) shuffled before splitting, the positional join is silently wrong — see §10.7 and use the content-key join below.
 
-### 8.6 Bucket reduce stage A — group chunks into per-bucket partials
+**Joining to the manifest by content key** (works for both shuffled and non-shuffled inputs — recommended default):
+
+```python
+import json, re
+from datetime import datetime, timezone
+
+def fmt_hms(ts): return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%H:%M:%S")
+PREAMBLE_OVERHEAD = len(
+    "Flow log fields (pipe-separated): time_utc|mac_a|mac_b|prot|tran|port_a|port_b|"
+    "bytes_a|bytes_b|pkts_a|pkts_b. Transport: 6=TCP, 17=UDP, 1=ICMP, 58=ICMPv6, 2=IGMP."
+    .encode("utf-8")) + 2
+
+manifest_by_key = {}
+for e in (json.loads(l) for l in open("data/manifest_chunked.jsonl")):
+    if e["n_flows"] == 0:
+        key = ("empty", e["device_id"], e["hour_utc"])
+    else:
+        key = (e["device_id"], e["hour_utc"], e["n_flows"],
+               fmt_hms(e["ts_start_min"]), fmt_hms(e["ts_start_max"]), e["n_bytes"])
+    manifest_by_key[key] = e["file_id"]
+
+PROMPT_RE = re.compile(
+    r"Device: (\S+?) \(.*?Hour: (\d+):\d+-\d+:\d+ UTC\."
+    r"(?: Chunk slice: (\d+) flows covering (\d+:\d+:\d+)-(\d+:\d+:\d+) UTC\.|"
+    r" Flow count: 0\.)")
+
+def record_to_key(rec):
+    m = PROMPT_RE.search(rec["prompt"])
+    if not m: return None
+    dev, hr, n, lo, hi = m.groups()
+    if n is None: return ("empty", dev, int(hr))
+    n_bytes = len(rec["inputs"][0]["data"].encode("utf-8")) - PREAMBLE_OVERHEAD
+    return (dev, int(hr), int(n), lo, hi, n_bytes)
+
+# Build keys from the same-order concatenated inputs (h1 + h2)
+keys = []
+for path in ("data/multihome_chunks_h1.jsonl", "data/multihome_chunks_h2.jsonl"):
+    keys.extend(record_to_key(json.loads(l)) for l in open(path))
+
+with open("data/predictions_chunks_raw.jsonl") as f, \
+     open("data/predictions_chunks.jsonl", "w") as out:
+    for key, line in zip(keys, f):
+        pred = json.loads(line)
+        fid = manifest_by_key.get(key)
+        if fid is None: continue   # log if you care
+        out.write(json.dumps({"file_id": fid, "line_index": 0,
+                              "prediction": pred.get("prediction", "")}) + "\n")
+```
+
+The content key is `(device_id, hour, n_flows, ts_lo, ts_hi, n_bytes)`. At 1 GB / 16 KB cap, **23,249 of 23,249** chunks join cleanly (6 latent collisions out of 23,249 — 0.03%; the `n_bytes` term disambiguates). See §10.7 for the rationale.
+
+### 8.6 Bucket reduce stage A — group chunks into per-bucket partials (split × 2)
 
 ```bash
+# Prep (single output JSONL covering all (device, hour) buckets — keep group-size at 3 to stay clear of the cliff)
 python 1_prepare_data/prepare_bucket_reduce.py --stage a \
-  --predictions data/predictions_chunked.jsonl \
-  --manifest data/manifest_chunked.jsonl \
-  --output data/bucket_reduce_a.jsonl \
-  --output-manifest data/manifest_bucket_reduce_a.jsonl
+  --predictions data/predictions_chunks.jsonl \
+  --manifest    data/manifest_chunked.jsonl \
+  --output      data/bucket_reduce_a.jsonl \
+  --output-manifest data/manifest_bucket_reduce_a.jsonl \
+  --group-size 3
 
-python 2_upload/upload_multipart.py data/bucket_reduce_a.jsonl
-python 3_batch_jobs/create_activity_detection_job.py \
-  --file bucket_reduce_a.jsonl \
-  --name multihome-bucket-reduce-a \
-  --max-new-tokens 1024
+# Positional split (no shuffle — preserves alignment with manifest_bucket_reduce_a.jsonl)
+./myenv/bin/python <<'PY'
+with open("data/bucket_reduce_a.jsonl") as f: lines = f.readlines()
+mid = len(lines) // 2
+open("data/bucket_reduce_a_a1.jsonl", "w").writelines(lines[:mid])
+open("data/bucket_reduce_a_a2.jsonl", "w").writelines(lines[mid:])
+PY
 
-python 4_download_outputs/download_outputs.py <stage_a_job_id> outputs/multihome-bucket-reduce-a
-python 4_download_outputs/extract_predictions.py outputs/multihome-bucket-reduce-a \
-  --upload-manifest data/uploaded_file_ids.jsonl \
-  --output data/predictions_bucket_reduce_a.jsonl
+# Upload + jobs in parallel (2 GPUs)
+python 2_upload/upload_multipart.py data/bucket_reduce_a_a1.jsonl &
+python 2_upload/upload_multipart.py data/bucket_reduce_a_a2.jsonl &
+wait
+
+python 3_batch_jobs/create_activity_detection_job.py --file bucket_reduce_a_a1.jsonl --name multihome-bucket-reduce-a-a1 --max-new-tokens 1024 --batch-size 1 --poll-interval 300 &
+python 3_batch_jobs/create_activity_detection_job.py --file bucket_reduce_a_a2.jsonl --name multihome-bucket-reduce-a-a2 --max-new-tokens 1024 --batch-size 1 --poll-interval 300 &
+wait
+
+# Download + concat (positional — we control the split so no content-key join needed)
+python 4_download_outputs/download_outputs.py <a1_job_id> outputs/multihome-bucket-reduce-a-a1
+python 4_download_outputs/download_outputs.py <a2_job_id> outputs/multihome-bucket-reduce-a-a2
+cat outputs/multihome-bucket-reduce-a-a1/output_*.jsonl \
+    outputs/multihome-bucket-reduce-a-a2/output_*.jsonl \
+  > data/predictions_bucket_reduce_a.jsonl
 ```
 
-For each `(device, hour)` bucket, Stage A groups the bucket's chunks into packs of up to 20 (configurable via `--group-size`) and emits one reduce record per group. At 1 GB this produces ~1700 records — average 3 partials per bucket (busy buckets have more, low-volume buckets have just 1). Each pack stays comfortably under the C model's ~21 KB narrative-heavy ceiling.
+For each `(device, hour)` bucket, Stage A groups the bucket's chunks into packs (up to `--group-size` chunks per pack) and emits one reduce record per group. **We use `--group-size 3`** — empirically the cliff-safe setting in this repo: zero `WARN  ... > 16,384` lines fired during prep on the 1 GB / 16 KB-chunk run, producing **~7,950 partial records** (average ~14 partials per bucket on the dense halves). The script's own default is **4** (lowered from 20 in commit `1086817`), which usually works but is enough to occasionally push a partial-record payload past the 16 KB / ~4K-token quality cliff (§10.6); we go one notch lower for zero-risk margin. Going to 5 or 6 would shave wall-clock further at the cost of more cliff warnings on dense buckets. Stage B's record count is unchanged regardless (always 576).
 
-### 8.7 Bucket reduce stage B — fold partials into one narrative per bucket
+### 8.7 Bucket reduce stage B — fold partials into one narrative per bucket (split × 2)
 
 ```bash
 python 1_prepare_data/prepare_bucket_reduce.py --stage b \
   --predictions data/predictions_bucket_reduce_a.jsonl \
-  --manifest data/manifest_bucket_reduce_a.jsonl \
-  --output data/bucket_reduce_b.jsonl \
+  --manifest    data/manifest_bucket_reduce_a.jsonl \
+  --output      data/bucket_reduce_b.jsonl \
   --output-manifest data/manifest_per_device_hour.jsonl
 
-python 2_upload/upload_multipart.py data/bucket_reduce_b.jsonl
-python 3_batch_jobs/create_activity_detection_job.py \
-  --file bucket_reduce_b.jsonl \
-  --name multihome-bucket-reduce-b \
-  --max-new-tokens 1024
+# Positional split (no shuffle)
+./myenv/bin/python <<'PY'
+with open("data/bucket_reduce_b.jsonl") as f: lines = f.readlines()
+mid = len(lines) // 2  # 288
+open("data/bucket_reduce_b_b1.jsonl", "w").writelines(lines[:mid])
+open("data/bucket_reduce_b_b2.jsonl", "w").writelines(lines[mid:])
+PY
 
-python 4_download_outputs/download_outputs.py <stage_b_job_id> outputs/multihome-bucket-reduce-b
-python 4_download_outputs/extract_predictions.py outputs/multihome-bucket-reduce-b \
-  --upload-manifest data/uploaded_file_ids.jsonl \
-  --output data/predictions_per_device_hour.jsonl
+python 2_upload/upload_multipart.py data/bucket_reduce_b_b1.jsonl &
+python 2_upload/upload_multipart.py data/bucket_reduce_b_b2.jsonl &
+wait
+
+python 3_batch_jobs/create_activity_detection_job.py --file bucket_reduce_b_b1.jsonl --name multihome-bucket-reduce-b-b1 --max-new-tokens 1024 --batch-size 1 --poll-interval 300 &
+python 3_batch_jobs/create_activity_detection_job.py --file bucket_reduce_b_b2.jsonl --name multihome-bucket-reduce-b-b2 --max-new-tokens 1024 --batch-size 1 --poll-interval 300 &
+wait
+
+python 4_download_outputs/download_outputs.py <b1_job_id> outputs/multihome-bucket-reduce-b-b1
+python 4_download_outputs/download_outputs.py <b2_job_id> outputs/multihome-bucket-reduce-b-b2
+cat outputs/multihome-bucket-reduce-b-b1/output_*.jsonl \
+    outputs/multihome-bucket-reduce-b-b2/output_*.jsonl \
+  > data/predictions_per_device_hour.jsonl
 ```
 
 Stage B always emits exactly **576 reduce records** — one per `(device, hour)` bucket — folding that bucket's Stage-A partials into a single device-hour narrative. The output sidecar `manifest_per_device_hour.jsonl` matches the shape the downstream device-day reduce script expects.
 
-### 8.8 Reduce stage 3: device-day (576 → 24)
+### 8.8 Reduce stage 3: device-day (576 → 24, split × 2)
 
 ```bash
 python 1_prepare_data/prepare_device_day_reduce.py \
   --predictions data/predictions_per_device_hour.jsonl \
-  --manifest data/manifest_per_device_hour.jsonl \
-  --output data/device_day_reduce.jsonl \
+  --manifest    data/manifest_per_device_hour.jsonl \
+  --output      data/device_day_reduce.jsonl \
   --output-manifest data/manifest_device_day.jsonl
 
-python 2_upload/upload_multipart.py data/device_day_reduce.jsonl
-python 3_batch_jobs/create_activity_detection_job.py \
-  --file device_day_reduce.jsonl \
-  --name multihome-device-day \
-  --max-new-tokens 2048
+# Positional split: 12 + 12
+./myenv/bin/python <<'PY'
+with open("data/device_day_reduce.jsonl") as f: lines = f.readlines()
+mid = len(lines) // 2  # 12
+open("data/device_day_reduce_d1.jsonl", "w").writelines(lines[:mid])
+open("data/device_day_reduce_d2.jsonl", "w").writelines(lines[mid:])
+PY
 
-python 4_download_outputs/download_outputs.py <device_day_job_id> outputs/multihome-device-day
-python 4_download_outputs/extract_predictions.py outputs/multihome-device-day \
-  --upload-manifest data/uploaded_file_ids.jsonl \
-  --output data/predictions_device_day.jsonl
+python 2_upload/upload_multipart.py data/device_day_reduce_d1.jsonl &
+python 2_upload/upload_multipart.py data/device_day_reduce_d2.jsonl &
+wait
+
+python 3_batch_jobs/create_activity_detection_job.py --file device_day_reduce_d1.jsonl --name multihome-device-day-d1 --max-new-tokens 2048 --batch-size 1 --poll-interval 60 &
+python 3_batch_jobs/create_activity_detection_job.py --file device_day_reduce_d2.jsonl --name multihome-device-day-d2 --max-new-tokens 2048 --batch-size 1 --poll-interval 60 &
+wait
+
+python 4_download_outputs/download_outputs.py <d1_job_id> outputs/multihome-device-day-d1
+python 4_download_outputs/download_outputs.py <d2_job_id> outputs/multihome-device-day-d2
+cat outputs/multihome-device-day-d1/output_*.jsonl \
+    outputs/multihome-device-day-d2/output_*.jsonl \
+  > data/predictions_device_day.jsonl
 ```
 
 Each of the 24 reduce records concatenates that device's 24 hourly narratives in a `=== HOURLY SUMMARIES (24) FOR <device> IN <home> ON <date> ===` envelope, ending with the synthesis instruction. Pack size ≈ 12 KB per record — well under the C model's ~21 KB narrative-heavy ceiling.
 
 ### 8.9 Reduce stages 4a/4b: user-day and house-day (24 → {6, 3})
 
-Both consume the device-day predictions and run as independent batch jobs:
+Both consume the device-day predictions and run as independent batch jobs. **These are too small to benefit from splitting** (6 and 3 records — queue/setup overhead dominates), so they're each submitted as a single job. The two jobs run in parallel and saturate both GPUs together:
 
 ```bash
 # User-day (personal devices only)
 python 1_prepare_data/prepare_user_day_reduce.py \
   --predictions data/predictions_device_day.jsonl \
-  --manifest data/manifest_device_day.jsonl \
-  --output data/user_day_reduce.jsonl \
+  --manifest    data/manifest_device_day.jsonl \
+  --output      data/user_day_reduce.jsonl \
   --output-manifest data/manifest_user_day.jsonl
 
 # House-day (every device — personal + shared)
 python 1_prepare_data/prepare_house_day_reduce.py \
   --predictions data/predictions_device_day.jsonl \
-  --manifest data/manifest_device_day.jsonl \
-  --output data/house_day_reduce.jsonl \
+  --manifest    data/manifest_device_day.jsonl \
+  --output      data/house_day_reduce.jsonl \
   --output-manifest data/manifest_house_day.jsonl
 
-python 2_upload/upload_multipart.py data/user_day_reduce.jsonl
-python 2_upload/upload_multipart.py data/house_day_reduce.jsonl
-python 3_batch_jobs/create_activity_detection_job.py --file user_day_reduce.jsonl  --name multihome-user-day  --max-new-tokens 2048
-python 3_batch_jobs/create_activity_detection_job.py --file house_day_reduce.jsonl --name multihome-house-day --max-new-tokens 2048
+python 2_upload/upload_multipart.py data/user_day_reduce.jsonl &
+python 2_upload/upload_multipart.py data/house_day_reduce.jsonl &
+wait
+
+python 3_batch_jobs/create_activity_detection_job.py --file user_day_reduce.jsonl  --name multihome-user-day  --max-new-tokens 2048 --batch-size 1 --poll-interval 60 &
+python 3_batch_jobs/create_activity_detection_job.py --file house_day_reduce.jsonl --name multihome-house-day --max-new-tokens 2048 --batch-size 1 --poll-interval 60 &
+wait
+
+python 4_download_outputs/download_outputs.py <user_day_job_id>  outputs/multihome-user-day
+python 4_download_outputs/download_outputs.py <house_day_job_id> outputs/multihome-house-day
 ```
 
-User-day pack size ≈ 3 KB (3 device-day narratives per human), house-day ≈ 8 KB (8 device-day narratives per home) — both fit in C-model context with margin.
+User-day pack size ≈ 3 KB (3 device-day narratives per human), house-day ≈ 8 KB (8 device-day narratives per home) — both fit in C-model context with margin. Output JSONLs land directly in `outputs/multihome-{user,house}-day/` — no extra join step needed since `view_results.py --manifest` consumes the output directory directly (see §8.10).
 
 ### 8.10 View results
 
@@ -751,8 +895,8 @@ python 5_view_results/view_results.py outputs/multihome-house-day --manifest dat
 
 | Stage | Records at 1 GB | Per-record size | Bound by |
 |---|---|---|---|
-| Chunk inference | ~38,700 | ≤10 KB | `--max-chunk-bytes` |
-| Bucket reduce A (intra-bucket) | ~1,700 | ≤20 KB | `--group-size` × per-chunk narrative length |
+| Chunk inference | ~38,700 (default 10 KB cap) / ~23,250 (validated 16 KB cap) | ≤10 KB (~2.5K tok) default; ≤16 KB (~4K tok) validated upper bound | `--max-chunk-bytes` |
+| Bucket reduce A (intra-bucket) | **~7,950 at `--group-size 3`** (our cliff-safe setting); ~5,800 at the script default of 4 | ≤16 KB (~4K tok) — sized to stay under quality cliff | `--group-size` × per-chunk narrative length |
 | Bucket reduce B (per-bucket) | 576 | ~3-8 KB | partial narrative length × group_count |
 | Device-day reduce | 24 | ~12 KB | 24 × hourly narrative length |
 | User-day reduce | 6 | ~3 KB | 3 × device-day narrative length |
@@ -764,39 +908,37 @@ Chunk count scales linearly with source size: at 1 GB ≈ 5.8M flows / 150 flows
 
 ### Wall-clock at 1 GB (observed)
 
-The end-to-end demo at 1 GB is **GPU-bound on the main chunk batch**. Numbers below come from an actual run against `pipeline: activity-detection v1.1.1-409-e749ac0` (May 2026, default `max_new_tokens=1024`):
+End-to-end is **GPU-bound on the main chunk batch**. Numbers below come from an actual run against `pipeline: activity-detection v1.1.1-409-e749ac0` (May 2026, `model_variant: newton/c:2.4.0-7b-base`, `batch_size: 1`, `max_new_tokens: 1024`, `--max-chunk-bytes 16384`). Every stage uses the **2-job split pattern** ("Stage X-1 / Stage X-2" running in parallel on 2 GPU nodes — see §8 intro bullet 3):
 
-| Stage | Records / files | Observed wall clock |
+| Stage | Records (h1+h2 split) | Observed wall clock |
 |---|---|---|
 | Generate 1 GB CSV | — | ~40 s |
-| Per-chunk prep | — | ~1–2 min (streaming, ~37K small file writes) |
-| Upload 37K files (`--concurrency 8`) | 37,000 | ~1–2 hr |
-| Main chunk batch (per sub-job) | 5,000 | **~41 hr** at ~29 s/step |
-| Main chunk batch (8 sub-jobs at observed org concurrency=2) | 37,000 | **~7 days** |
-| Bucket reduce A (upload + batch + download) | ~1,700 | ~10–15 hr |
-| Bucket reduce B (upload + batch + download) | 576 | ~3–5 hr |
-| Device-day prep + upload + batch + download | 24 | ~10–20 min |
-| User-day + house-day (parallel) | 6 + 3 | ~5–10 min each |
+| Per-chunk prep + concat + split | ~23K chunks (16 KB cap) | ~2–3 min |
+| Multipart upload × 2 (parallel) | 2 × ~200 MB | ~1–2 min |
+| **Main chunk batch (h1 / h2 in parallel)** | 11,625 + 11,624 records | **~46 hr** (single-job extrapolation: ~62 hr; split saves ~16 hr) |
+| Download + concat + content-key join | — | ~5 min |
+| Bucket reduce A prep | — | ~10 s |
+| **Bucket reduce A (a1 / a2 in parallel)** | 3,984 + 3,984 records (group-size 3) | **~7–9 hr** (single-job extrapolation: ~13–18 hr) — *currently RUNNING; numbers will be updated after completion* |
+| Bucket reduce B (b1 / b2 in parallel) | 288 + 288 records | est. ~1.5–2 hr *(pending validation)* |
+| Device-day (d1 / d2 in parallel) | 12 + 12 records | est. ~10–15 min *(pending validation)* |
+| User-day + house-day (parallel, 1 job each) | 6 + 3 records | est. ~5–10 min total *(pending validation)* |
 
-**Two factors shape the chunk-batch wall clock**, and both vary by deployment:
+**Total end-to-end (1 GB, 2 GPU nodes, 16 KB chunks):** **~55–60 hours** dominated by the main chunk batch. The chunk batch alone is ~46 hr out of that.
 
-1. **Per-step time = `max_new_tokens` × generation rate.** At `max_new_tokens=1024` the C model takes ~29 s/step; lowering to 256 drops it ~4× to ~7 s/step. For per-chunk slice narratives (bucket-reduce input), 256 tokens is usually sufficient — bump to 1024+ only for the final reduce stages where you want multi-paragraph output.
+**Two factors shape the chunk-batch wall clock:**
 
-2. **Org-level batch-job concurrency cap.** This run observed 2 concurrent RUNNING jobs at any time; parts 003–008 stayed PENDING until earlier sub-jobs completed. With 8 sub-jobs and concurrency=2, the chunk batch serializes into 4 waves. If your org has more pods allocated, expect proportionally less wall-clock — at concurrency=8, total chunk-batch time drops from ~7 days to ~41 hours.
+1. **Per-step time = `max_new_tokens` × generation rate × per-record context size.** At `max_new_tokens=1024` and 16 KB chunk inputs the C model takes ~18–22 s/record; lowering `max_new_tokens` to 256 drops it ~4× to ~5–7 s/record. Reduce stages have smaller inputs (a few KB of narrative vs. 16 KB of flow rows) and run ~3× faster per record at the same `max_new_tokens`: Stage A observed ~6–8 s/record.
 
-| Concurrency | 8 sub-jobs of ~5K files (1024 tokens) | with `--max-new-tokens 256` |
-|---|---|---|
-| 2 (observed) | ~7 days | **~40 hr** |
-| 4 | ~3.5 days | ~20 hr |
-| 8 | ~41 hr | **~10 hr** |
+2. **Org-level batch-job concurrency cap.** Confirmed ≥2 (both halves of every split observed RUNNING simultaneously). The 2-job split assumes exactly 2 — if your org has higher concurrency (4, 8), split each stage into more pieces (a1/a2/a3/a4...) proportionally for further wall-clock savings.
 
-**Tuning levers** if you need to fit the demo in a tighter window:
+**Tuning levers if you need a tighter window:**
 
-- **Lower `--max-new-tokens` to 256** on the chunk batch (`create_activity_detection_job.py --max-new-tokens 256`). Bucket-reduce, device-day, user-day, and house-day reduces can keep 1024 or 2048 since they need richer output and run on far fewer records.
-- **Run at smaller scale** (100 MB → ~3.7K files, ~10× shorter wall-clock at every stage).
-- **Negotiate higher org concurrency** with your platform team.
+- **Lower `--max-new-tokens` to 256** on the chunk batch — Bucket-reduce, device-day, user-day, and house-day reduces can keep 1024 or 2048 since they need richer output and run on far fewer records.
+- **Run at smaller scale** (100 MB → ~2,300 chunks at 16 KB cap, ~10× shorter wall-clock at every stage).
+- **Negotiate higher org concurrency** with your platform team — splits scale linearly.
+- **Default to `--max-chunk-bytes 10240` (10 KB)** if cliff-margin matters more than narrative richness. ~38K chunks at 1 GB instead of ~23K, but each is smaller and faster per record (~8–12 s vs. ~18–22 s).
 
-**Beyond 1 GB:** both file count and chunk count grow linearly with source size, so 10 GB = ~370K files. Even at concurrency=8 with `max_new_tokens=256`, that's ~100 hours just for the main chunk batch. Past 1 GB the architecture works in principle but isn't practical without higher pod concurrency, batched-multi-job submission, or per-bucket pre-aggregation.
+**Beyond 1 GB:** chunk count grows linearly with source size — 10 GB ≈ 230K chunks at 16 KB cap. Even with the 2-job split that's ~460 hours on the chunk batch alone. Past 1 GB the architecture works in principle but isn't practical without higher pod concurrency (4+ way splits), batched-multi-job submission, or per-bucket pre-aggregation.
 
 ## 9. Cleanup between runs
 
@@ -914,22 +1056,14 @@ SUCCESS Processed 1 items (1 success, 0 failed) from <name>.jsonl
 **The actual failure signals are:**
 
 - `WARN inference.truncation: Batch N: M items exceed token_budget=16,384` — pre-flight warning that one or more records are over the per-record budget. Typically followed by `ERROR pod.terminated: OOMKilled` and `Status: FAILED`. See [§10.2](#102-failed--input-over-the-per-record-token-budget).
-- `WARN inference.oom: CUDA OOM on batch 0 (16 items), recovering: splitting into 8 + 8` — engine-level OOM during batch initialization. Sometimes recovers; sometimes cascades to bs=1 and crashes the pod. See [§10.6](#106-oom-cascade-on-batch-size-escalation).
+- `WARN inference.oom: CUDA OOM on batch 0 (16 items), recovering: splitting into 8 + 8` — engine-level OOM during batch initialization. Sometimes recovers; sometimes cascades to bs=1 and crashes the pod. See [§10.5](#105-oom-cascade-on-batch-size-escalation).
 - `ERROR pod.terminated: Container worker terminated: OOMKilled (exit=137)` — pod-level OOM, fatal. The job ends `FAILED` with `BackoffLimitExceeded`.
 - `FAILED Processing failed for <name>.jsonl` — typically wrong content-type at upload (see [§10.1](#101-completed-with-no-actual-predictions-wrong-content-type-at-upload)) or other unrecoverable file-read error.
-- **Empty or 1–3-character prediction text** in the downloaded output — **silent CSV-heavy quality cliff failure** ([§10.7](#107-csv-heavy-quality-cliff-silent-garbage-with-no-warning)). The events log will be clean and `Status: COMPLETED` — only the prediction text reveals the problem. Always read at least the first prediction.
+- **Empty or 1–3-character prediction text** in the downloaded output — **silent CSV-heavy quality cliff failure** ([§10.6](#106-csv-heavy-quality-cliff-silent-garbage-with-no-warning)). The events log will be clean and `Status: COMPLETED` — only the prediction text reveals the problem. Always read at least the first prediction.
 
-In short: **don't rely on the top-level `Status: COMPLETED`.** Read the full events log AND inspect at least the first prediction's text. Silent failures (§10.7) are the most insidious — neither the platform's status nor the events log will warn you.
+In short: **don't rely on the top-level `Status: COMPLETED`.** Read the full events log AND inspect at least the first prediction's text. Silent failures (§10.6) are the most insidious — neither the platform's status nor the events log will warn you.
 
-### 10.5 Output filenames don't join back to input file_ids
-
-**Symptom:** `extract_predictions.py` reports `WARNING: N output files could not be matched to a file_uid.`
-
-**Cause:** the upload manifest (`data/uploaded_file_ids.jsonl`) is missing entries for some files — typically because the section-8 directory upload skipped them via a 409 (and recorded `file_uid=""`), or you ran the batch job against files uploaded in a different session whose `file_uid`s aren't in the current manifest.
-
-**Fix:** ensure every file submitted to the batch job has its `file_uid` recorded in `data/uploaded_file_ids.jsonl`. Easiest path is to start fresh: `python cleanup.py --local --remote`, then re-run the upload step from scratch.
-
-### 10.6 OOM cascade on batch-size escalation (C 2.5.1, partial in 2.4.0)
+### 10.5 OOM cascade on batch-size escalation (C 2.5.1, partial in 2.4.0)
 
 **Symptom (C 2.5.1, default model):** the very first batch OOMs at `bs=16` and bisects all the way to `bs=1` without recovering, then crashes the pod:
 
@@ -1001,7 +1135,7 @@ A separate 4,627-line probe (`p4`) reached batch 35 (560 items) before tripping 
 
 **This entry should partially go stale once the C 2.5.1 budget is fixed.** Re-test by dropping `--model-variant` and submitting a small job; if it runs cleanly without the OOM-at-bs=1 pattern, the C 2.5.1 fix has landed. The `batch_size: 4` cap will likely stay relevant longer (it's a defensive cap, not a workaround for a specific bug).
 
-### 10.7 CSV-heavy quality cliff (silent garbage with no warning)
+### 10.6 CSV-heavy quality cliff (silent garbage with no warning)
 
 **Symptom:** the events log shows clean batch processing — `Batch 0: processed 1 items (1 success, 0 failed)`, `inference.completed`, no warnings — but the downloaded predictions are 1-3 character fragments:
 
@@ -1049,6 +1183,14 @@ If the prediction lengths are 0–3 characters, you've crossed the cliff. Re-pre
 **Why no warning fires:** the model is producing tokens — the platform just doesn't second-guess what it produces. Generation completes; predictions get returned; the engine's only job is to confirm "did the worker exit cleanly?" That's why §10.4 emphasizes you must always read prediction text, not just the events log.
 
 **Fix:** use `--max-chunk-bytes 10240` (the proven default), or up to **16384** which is empirically validated and produces richer narratives. **Do not exceed 16 KB without re-running the cliff sweep** with a 5-record probe at the new size — there is no other signal that you've crossed.
+
+### 10.7 Position-based join silently mislabels predictions when the input JSONL was shuffled
+
+**Symptom:** `view_results.py --manifest` runs cleanly and prints labeled narratives, but the manifest scope (e.g., `Home A • Alice • alice_phone • 07:00`) doesn't match the prediction text (which talks about a `smart_speaker` at `20:00`). No error, no warning — predictions look real, just attached to the wrong device-hour.
+
+**Cause:** when you concatenate the per-chunk single-record JSONLs into one master JSONL and split it into shards (e.g., `_h1.jsonl`, `_h2.jsonl`) — especially if you `shuf` before splitting to balance shard size — the master file's row order no longer matches the sidecar manifest's row order. The output preserves `line_index` relative to *the shuffled input*, not relative to the manifest. A positional join (`manifest[i] ↔ output[i]`) then silently pairs every prediction with the wrong manifest entry.
+
+**Fix:** join by **content** extracted from the input prompt, not by position. Every prompt emitted by `prepare_per_device_hour_jsonls.py` embeds `device_id`, `hour`, `n_flows`, and the chunk's `ts_lo`–`ts_hi` UTC range — enough to uniquely key against the manifest. Add `n_bytes` (from `len(inputs[0].data.encode("utf-8"))` minus the fixed preamble) for the last few percent of collisions when a device has multiple chunks within the same hour. If you never shuffle or split the master JSONL, positional join is safe — but there's no signal that tells you which case you're in, so prefer content-based joining as the default whenever a master JSONL passes through any reordering step.
 
 ## Why this design
 
