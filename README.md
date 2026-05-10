@@ -375,7 +375,7 @@ The home-level run with the uncapped 376 MB `inputs[0].data` fails fast. The pla
 
 Three things are useful in this output:
 
-1. **Named token budget.** `token_budget=16,384` — the per-record context window in tokens, surfaced explicitly. This is the same number the §8.2 binary search converges on (~150 GHOST-IoT flow rows ≈ ~10 KB ≈ ~2.5K tokens, with the rest of the budget eaten by activation memory and pre-allocated batch overhead).
+1. **Named token budget.** `token_budget=16,384` — the per-record context window in tokens, surfaced explicitly. The §8.2 cliff sweep shows the usable input ceiling sits at ~4K tokens / ~250 GHOST-IoT flow rows / ~16 KB before the quality cliff hits; the remainder of the nominal 16,384-token budget is eaten by activation memory and pre-allocated batch overhead.
 2. **Pre-flight warning, not silent.** The warning fires *before* generation starts, naming the specific record(s) that exceed the budget. You can fail fast on this signal.
 3. **Honest terminal status.** `Status: FAILED` matches reality.
 
@@ -456,7 +456,7 @@ Running all four targets back-to-back without cleanup needs 311 GB of free space
 
 ## 8. Multi-home batch with many small files
 
-The single-record approach in sections 2–6 fits in context only for the small reference dataset (a few hundred flows). At GB scale, Activity Detection's per-record context budget (~150 flows / ~10 KB / ~2.5K tokens — see [section 7](#7-scale-testing-with-synthetic-data) for the observed failure modes, and §8.2 below for the binary search that produced this number) is far smaller than the day's flow log, so a single record carrying everything either silently truncates or OOMs.
+The single-record approach in sections 2–6 fits in context only for the small reference dataset (a few hundred flows). At GB scale, Activity Detection's per-record content budget (~250 flows / ~16 KB / ~4K tokens — see [section 7](#7-scale-testing-with-synthetic-data) for the observed failure modes, and §8.2 below for the cliff sweep that produced this number) is far smaller than the day's flow log, so a single record carrying everything either silently truncates or OOMs.
 
 This section's **multi-home batch pattern** solves both problems at once:
 
@@ -541,10 +541,11 @@ Per-device row counts are allocated proportionally — phones and laptops domina
 python 1_prepare_data/prepare_per_device_hour_jsonls.py \
   --input data/wifi_flows_multihome_1gb.csv \
   --output-dir data/per_device_hour \
-  --manifest data/manifest_chunked.jsonl
+  --manifest data/manifest_chunked.jsonl \
+  --max-chunk-bytes 16384
 ```
 
-The prep script streams the CSV, buckets flows by `(device_mac, hour_utc)`, and packs each bucket's flows into chunks using **greedy size-based fill**: append flow rows to a chunk until the chunk's flow-log payload approaches `--max-chunk-bytes` (default 10 KB ≈ 150 GHOST-IoT-formatted flow rows ≈ 2.5K tokens), then close the chunk and write it to **its own single-record JSONL file**. **No flows are dropped — every row in the source ends up in exactly one chunk.** A 12,345-flow bucket produces ~83 separate JSONL files (chunks 0–82), each ≤10 KB.
+The prep script streams the CSV, buckets flows by `(device_mac, hour_utc)`, and packs each bucket's flows into chunks using **greedy size-based fill**: append flow rows to a chunk until the chunk's flow-log payload approaches `--max-chunk-bytes` (we pass `16384` — ~250 GHOST-IoT-formatted flow rows ≈ ~4K tokens, the empirically validated upper bound; see §8.2's cliff sweep below), then close the chunk and write it to **its own single-record JSONL file**. **No flows are dropped — every row in the source ends up in exactly one chunk.** A 12,345-flow bucket produces ~50 separate JSONL files (chunks 0–49), each ≤16 KB.
 
 **Why one record per file at this stage?** The chunker emits per-chunk JSONLs primarily so its sidecar manifest can use the chunk filename as a stable `file_id` (the manifest records device, hour, n_flows, ts range per chunk). Downstream we **concatenate the per-chunk files into a single multi-record JSONL and upload via multipart** rather than uploading thousands of small files — multipart at GB scale is dramatically faster and avoids per-file 409s on re-run.
 
@@ -554,16 +555,16 @@ Outputs:
 
 | File / dir | Contents |
 |---|---|
-| `data/per_device_hour/dev_<home_id>__<device_id>__hHH__cNNNN.jsonl` (~37K at 1 GB) | Single-record JSONL — one chunk per file, ≤10 KB each |
-| `data/manifest_chunked.jsonl` (~37K lines at 1 GB) | Sidecar: one entry per chunk file, mapping `file_id` → `{home_id, human, device_id, mac, hour_utc, chunk_index, n_flows, n_bytes, ts_start_min, ts_start_max, ...}` |
+| `data/per_device_hour/dev_<home_id>__<device_id>__hHH__cNNNN.jsonl` (~23K at 1 GB) | Single-record JSONL — one chunk per file, ≤16 KB each |
+| `data/manifest_chunked.jsonl` (~23K lines at 1 GB) | Sidecar: one entry per chunk file, mapping `file_id` → `{home_id, human, device_id, mac, hour_utc, chunk_index, n_flows, n_bytes, ts_start_min, ts_start_max, ...}` |
 
-File count scales linearly with source size: 1 GB ≈ 37K files, 10 GB ≈ 370K, etc. The 576-bucket grid is fixed by topology (24 devices × 24 hours), but each bucket's chunk count varies with that device-hour's flow volume.
+File count scales linearly with source size: 1 GB ≈ 23K files, 10 GB ≈ 230K, etc. The 576-bucket grid is fixed by topology (24 devices × 24 hours), but each bucket's chunk count varies with that device-hour's flow volume.
 
 Memory: the script keeps 576 in-flight chunk buffers (each ≤ `max_chunk_bytes`) ≈ ~6 MB RAM regardless of source size. Streaming on the input side, so any CSV size works. Each chunk file is opened, written in one shot, and closed — no concurrent file-handle pressure.
 
-#### Why the per-chunk byte cap is 10 KB (empirically observed)
+#### Why the per-chunk byte cap is ≤16 KB (empirically observed)
 
-The 10 KB cap is binding for **two independent reasons**, both confirmed by experiment in May 2026 against `pipeline activity-detection v1.1.1-409-e749ac0`:
+A ≤16 KB cap is binding for **two independent reasons**, both confirmed by experiment in May 2026 against `pipeline activity-detection v1.1.1-409-e749ac0`:
 
 ##### Reason 1: GPU memory at batch initialization (mostly fixed by `batch_size: 4`)
 
@@ -576,7 +577,7 @@ worker:
     batch_size: 4                            # cap the engine at bs=4 (no bs=24 escalation)
 ```
 
-These two settings together let chunks up to ~10 KB run cleanly through batched inference at bs=4. **Without `batch_size: 4`, the engine still escalates to bs=24 and crashes; without `model_variant: newton/c:2.4.0-7b-base`, even bs=1 fails on first allocation.**
+These two settings together let chunks up to ~16 KB run cleanly through batched inference at bs=4. **Without `batch_size: 4`, the engine still escalates to bs=24 and crashes; without `model_variant: newton/c:2.4.0-7b-base`, even bs=1 fails on first allocation.**
 
 ##### Reason 2: CSV-heavy quality cliff (no warning, silent garbage)
 
@@ -586,9 +587,9 @@ Even when per-line context fits the platform's 16,384-token budget AND batch ini
 
 | `--max-chunk-bytes` cap | Avg `inputs[0].data` | ~Tokens (data)¹ | `WARN inference.truncation`? | Output quality |
 |---|---|---|---|---|
-| 10240 (10 KB, current default) | 10.4 KB | ~2.5k | None | **Real narratives** ✓ |
+| 10240 (10 KB) | 10.4 KB | ~2.5k | None | **Real narratives** ✓ |
 | 12288 (12 KB) | 12.4 KB | ~3k | None | **Real narratives** ✓ |
-| 16384 (16 KB) | 16.5 KB | **~4k** (last good) | None | **Real narratives** ✓ (richer than 12 KB — more specific volume numbers, peak-hour observations) |
+| **16384 (16 KB) — recommended** | 16.5 KB | **~4k** (last good) | None | **Real narratives** ✓ (richer than 12 KB — more specific volume numbers, peak-hour observations) |
 | 20480 (20 KB) | 20.6 KB | ~5k | None | ✗ Garbage (`'72\|1'`, `'0'`, `''`) |
 | 24576 (24 KB) | 24.5 KB | ~6k | None | ✗ Garbage |
 | 28672 (28 KB) | 28.8 KB | ~7k | None | ✗ Garbage |
@@ -608,20 +609,18 @@ Even when per-line context fits the platform's 16,384-token budget AND batch ini
 1. **The truncation warning fires at ≥41 KB**, not at the much higher 16K-token estimate (~64 KB by naive `bytes/4`). The platform's tokenizer counts pipe-separated flow rows at ~0.4 tokens per byte, not the ~0.25 a generic estimate would suggest. So `inputs[0].data ≥ 41 KB` ≈ `15,360+ tokens`, exceeding the 16,384 − 1024(max_new_tokens) − ~200(prompt overhead) input ceiling.
 2. **The quality cliff sits between 16.5 KB and 20.6 KB**, well below the truncation threshold. **At ≤ 16.5 KB the model produces real narratives. At ≥ 20.6 KB it produces garbage with no warning.** The model auto-completes tabular content rather than analyzing it.
 
-##### Default `--max-chunk-bytes` rationale
+##### Recommended `--max-chunk-bytes` setting
 
-The proven safe range is **10 KB (default) to 16 KB (empirically validated upper bound)**. 10 KB has ~60% margin below the cliff; 16 KB sits right under it but produces meaningfully richer narratives (more specific numbers, peak-hour observations) because the model has 1.6× more flow data to work with.
+**We use `--max-chunk-bytes 16384` (~4K tokens, ~250 flows/chunk)** — the empirically validated upper bound. It sits just under the quality cliff (16.5 KB last good, 20.6 KB garbage) and produces meaningfully richer narratives than smaller caps (more specific volume numbers, peak-hour observations). The script's argparse default is still `10240` for backwards compatibility; pass `--max-chunk-bytes 16384` explicitly to get the validated setting.
 
 | Cap | Trade-off |
 |---|---|
-| `--max-chunk-bytes 10240` (default) | Safe, well-tested, 50% margin below cliff. ~150 flows / chunk. |
-| `--max-chunk-bytes 12288` | Validated empirically; richer narratives. ~180 flows / chunk. |
-| `--max-chunk-bytes 16384` | **Empirically maximum useful** — at the cliff edge, narratives are richest, but very little margin. Re-validate with a 5-record probe before committing to a long run. |
+| **`--max-chunk-bytes 16384` (recommended)** | **Empirically validated upper bound** — narratives at their richest, ~250 flows/chunk, ~23K chunks at 1 GB. Sits right under the cliff; do not raise without re-running the sweep. |
+| `--max-chunk-bytes 12288` | Conservative fallback — ~180 flows/chunk, slightly less narrative detail. |
+| `--max-chunk-bytes 10240` (script default) | Most conservative — ~150 flows/chunk, ~60% margin below cliff. ~38K chunks at 1 GB (more upload + inference overhead). |
 | `--max-chunk-bytes > 16384` | **Don't.** ≥ 20 KB = silent garbage; ≥ 41 KB = explicit truncation warning. |
 
 Going beyond 16 KB requires re-running the cliff sweep — there is *zero* signal in the events log to distinguish "fits" from "garbage" until you read the prediction text.
-
-**Multi-record-per-file architecture aside.** An earlier UI test uploaded a 196-record JSONL (each record ~10 KB, file total 2 MB) and the platform OOMed during batch processing — bisected from `bs=16` all the way down to `bs=1` and still OOMed. With `batch_size: 4` (added later) the platform respects the cap and batches normally. Either architecture (one record per file × N files, or one file × N records) works as long as `batch_size: 4` is set.
 
 ### 8.3 Concat per-chunk JSONLs, split positionally, upload both halves
 
@@ -895,14 +894,14 @@ python 5_view_results/view_results.py outputs/multihome-house-day --manifest dat
 
 | Stage | Records at 1 GB | Per-record size | Bound by |
 |---|---|---|---|
-| Chunk inference | ~38,700 (default 10 KB cap) / ~23,250 (validated 16 KB cap) | ≤10 KB (~2.5K tok) default; ≤16 KB (~4K tok) validated upper bound | `--max-chunk-bytes` |
+| Chunk inference | **~23,250 at `--max-chunk-bytes 16384`** (recommended) | ≤16 KB (~4K tokens) per chunk | `--max-chunk-bytes` |
 | Bucket reduce A (intra-bucket) | **~7,950 at `--group-size 3`** (our cliff-safe setting); ~5,800 at the script default of 4 | ≤16 KB (~4K tok) — sized to stay under quality cliff | `--group-size` × per-chunk narrative length |
 | Bucket reduce B (per-bucket) | 576 | ~3-8 KB | partial narrative length × group_count |
 | Device-day reduce | 24 | ~12 KB | 24 × hourly narrative length |
 | User-day reduce | 6 | ~3 KB | 3 × device-day narrative length |
 | House-day reduce | 3 | ~8 KB | 8 × device-day narrative length |
 
-Chunk count scales linearly with source size. At the default 10 KB cap (~150 flows/chunk): 1 GB ≈ 38K chunks, 10 GB ≈ 380K. At the validated 16 KB cap (~250 flows/chunk): 1 GB ≈ 23K chunks, 10 GB ≈ 230K. The pipeline's *structure* (576 device-hour buckets, 24 device-day records, 6+3 user/house-day records) stays identical at any scale — only stage 1's chunk count grows.
+Chunk count scales linearly with source size at the recommended 16 KB cap (~250 flows/chunk): 1 GB ≈ 23K chunks, 10 GB ≈ 230K. The pipeline's *structure* (576 device-hour buckets, 24 device-day records, 6+3 user/house-day records) stays identical at any scale — only stage 1's chunk count grows.
 
 **No sampling, no truncation:** every flow in the source CSV ends up in exactly one chunk; chunk narratives are folded losslessly through Stages A/B into one device-hour narrative. Stages 3-4 then summarize across hours, devices, users, and homes.
 
@@ -936,13 +935,12 @@ End-to-end is **GPU-bound on the main chunk batch**. Numbers below come from an 
 - **Lower `--max-new-tokens` to 256** on the chunk batch — Bucket-reduce, device-day, user-day, and house-day reduces can keep 1024 or 2048 since they need richer output and run on far fewer records.
 - **Run at smaller scale** (100 MB → ~2,300 chunks at 16 KB cap, ~10× shorter wall-clock at every stage).
 - **Negotiate higher org concurrency** with your platform team — splits scale linearly.
-- **Default to `--max-chunk-bytes 10240` (10 KB)** if cliff-margin matters more than narrative richness. ~38K chunks at 1 GB instead of ~23K, but each is smaller and faster per record (~8–12 s vs. ~18–22 s).
 
 **Beyond 1 GB:** chunk count grows linearly with source size — 10 GB ≈ 230K chunks at 16 KB cap. Even with the 2-job split that's ~460 hours on the chunk batch alone. Past 1 GB the architecture works in principle but isn't practical without higher pod concurrency (4+ way splits), batched-multi-job submission, or per-bucket pre-aggregation.
 
 ## 9. Cleanup between runs
 
-A full section-8 run leaves several gigabytes of generated artifacts on disk — synthetic CSVs, ~23K–38K chunk JSONLs (depending on `--max-chunk-bytes`), manifests, predictions, downloaded outputs. The Files API also keeps every uploaded filename indefinitely, so re-running the same pipeline trips a 409 Conflict on the second upload of any file with the same name. `cleanup.py` at the repo root handles both.
+A full section-8 run leaves several gigabytes of generated artifacts on disk — synthetic CSVs, ~23K chunk JSONLs (at the recommended 16 KB cap), manifests, predictions, downloaded outputs. The Files API also keeps every uploaded filename indefinitely, so re-running the same pipeline trips a 409 Conflict on the second upload of any file with the same name. `cleanup.py` at the repo root handles both.
 
 ```bash
 # Dry-run (default) — list everything that WOULD be deleted, touch nothing
@@ -1025,9 +1023,9 @@ Status: FAILED
 
 A single oversize record triggers an explicit pre-flight `WARN inference.truncation` event naming the budget, followed by pod-level OOMKilled and an honest `Status: FAILED` in ~5 minutes.
 
-**Cause:** `inputs[0].data` exceeds the C model's effective per-record context window — the platform reports this directly as `token_budget=16,384`. In practice the empirical safe-cap is tighter (~2.5K tokens / ~10 KB / ~150 GHOST-IoT flow rows) because activation memory and pre-allocated batch overhead consume part of the 16K nominally-available budget. See section 8.2's binary search.
+**Cause:** `inputs[0].data` exceeds the C model's effective per-record context window — the platform reports this directly as `token_budget=16,384`. In practice the empirical safe-cap is tighter (~4K tokens / ~16 KB / ~250 GHOST-IoT flow rows) because activation memory and pre-allocated batch overhead consume part of the 16K nominally-available budget. See section 8.2's cliff sweep.
 
-**Fix:** keep every record under the 10 KB / 150-flow ceiling. Section 8's dynamic chunking does this automatically; for the simple flow in sections 2–6, restrict your input scope to a small enough window. Don't raise `--max-chunk-bytes` past 10 KB without re-running the binary search in section 8.2.
+**Fix:** keep every record under the 16 KB / 250-flow ceiling. Section 8's dynamic chunking does this automatically (`--max-chunk-bytes 16384`); for the simple flow in sections 2–6, restrict your input scope to a small enough window. Don't raise `--max-chunk-bytes` past 16 KB without re-running the cliff sweep in section 8.2.
 
 ### 10.3 409 Conflict on re-upload
 
@@ -1076,7 +1074,7 @@ ERROR  CUDA OOM on batch 0 (1 items), cannot reduce further
 ERROR  GPU memory unrecoverable: 5 consecutive OOMs, crashing pod for restart
 ```
 
-This happens even when every input line is well within `token_budget=16,384` (e.g. 10 KB / ~2.6K tokens — 16% of the budget). No `WARN inference.truncation` event fires.
+This happens even when every input line is well within `token_budget=16,384` (e.g. 16 KB / ~4K tokens — 24% of the budget at our recommended cap). No `WARN inference.truncation` event fires.
 
 **Cause:** per the platform team, the C 2.5.1 memory-budget calculation is incorrect — the model overstates the GPU memory it has available. Bisection cannot recover because the platform pre-allocates batch memory based on the wrong budget.
 
@@ -1182,7 +1180,7 @@ If the prediction lengths are 0–3 characters, you've crossed the cliff. Re-pre
 
 **Why no warning fires:** the model is producing tokens — the platform just doesn't second-guess what it produces. Generation completes; predictions get returned; the engine's only job is to confirm "did the worker exit cleanly?" That's why §10.4 emphasizes you must always read prediction text, not just the events log.
 
-**Fix:** use `--max-chunk-bytes 10240` (the proven default), or up to **16384** which is empirically validated and produces richer narratives. **Do not exceed 16 KB without re-running the cliff sweep** with a 5-record probe at the new size — there is no other signal that you've crossed.
+**Fix:** use `--max-chunk-bytes 16384` (the empirically validated upper bound and our recommended setting). **Do not exceed 16 KB without re-running the cliff sweep** with a 5-record probe at the new size — there is no other signal that you've crossed.
 
 ### 10.7 Position-based join silently mislabels predictions when the input JSONL was shuffled
 
