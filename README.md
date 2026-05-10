@@ -462,7 +462,7 @@ This section's **multi-home batch pattern** solves both problems at once:
 
 - **Context fit:** chunk the input dynamically — for each `(device, hour)` bucket, pack flow rows into chunks until each chunk hits the byte budget, then close it and start a new chunk. **No flows are dropped** — high-volume buckets simply produce more chunks. At 1 GB the chunk batch processes **23,249 independent inferences** at `--max-chunk-bytes 16384` (~4K tokens / chunk). The 576 device-hour buckets stay constant (24 devices × 24 hours); only the chunks-per-bucket count varies with flow volume.
 - **Multi-tenant scope:** model a realistic deployment with multiple homes, multiple humans per home, and a mix of personal and shared devices. Five follow-up reduce jobs (bucket-A → bucket-B → device-day → user-day + house-day) fold the chunks back into per-device, per-user, and per-house daily summaries.
-- **Throughput — 2 GPU nodes:** the org's batch-job concurrency is ≥2 (confirmed: pairs of jobs run RUNNING simultaneously). Every batch in this section is split into **two positional halves** (`_a1` / `_a2`, `_h1` / `_h2`, etc.) and submitted as two independent jobs so both GPU nodes stay saturated. Splits are positional (lines `[0:N/2]` and `[N/2:]`, no shuffle), so the post-job join is trivially `cat a1_output a2_output` — positionally aligned with the single source manifest, no content-key remap needed. This roughly halves wall-clock at zero quality cost: the chunks batch (23K records at 16 KB cap) finished in ~46h split vs. an extrapolated ~62h single-job; Stage A (~8K records, group-size 3) targets ~7–9h split vs. ~13–18h single-job.
+- **Throughput — 2 GPU nodes:** the org's batch-job concurrency is ≥2 (confirmed: pairs of jobs run RUNNING simultaneously). Every batch in this section is split into **two positional halves** (`_a1` / `_a2`, `_h1` / `_h2`, etc.) and submitted as two independent jobs so both GPU nodes stay saturated. Splits are positional (lines `[0:N/2]` and `[N/2:]`, no shuffle), so the post-job join is trivially `cat a1_output a2_output` — positionally aligned with the single source manifest, no content-key remap needed. This roughly halves wall-clock at zero quality cost: the chunks batch (23K records at 16 KB cap) finished in **59:17:46** split vs. an extrapolated ~118h single-job; Stage A (~8K records, group-size 3) targets ~7–9h split vs. ~13–18h single-job.
 
 The pattern is adapted from the [wifi-multi `/query` demo](https://github.com/archetypeai/archetypeai-query-examples-wifi-multi) — same topology, same prompt structure — but rebuilt around the **batch jobs + Files API** instead of the synchronous `/query` endpoint. The batch pattern's selling point: independent of source CSV size (1 MB, 1 GB, or 200 GB), the prep step always emits 576 files, each fitting Activity Detection's per-record context budget.
 
@@ -914,7 +914,7 @@ End-to-end is **GPU-bound on the main chunk batch**. Numbers below come from an 
 | Generate 1 GB CSV | — | ~40 s |
 | Per-chunk prep + concat + split | ~23K chunks (16 KB cap) | ~2–3 min |
 | Multipart upload × 2 (parallel) | 2 × ~200 MB | ~1–2 min |
-| **Main chunk batch (h1 / h2 in parallel)** | 11,625 + 11,624 records | **~46 hr** (single-job extrapolation: ~62 hr; split saves ~16 hr) |
+| **Main chunk batch (h1 / h2 in parallel)** | 11,625 + 11,624 records | **59:17:46** (≈ 59.3 hr observed; single-job extrapolation: ~118 hr; split saves ~59 hr) |
 | Download + concat + content-key join | — | ~5 min |
 | Bucket reduce A prep | — | ~10 s |
 | **Bucket reduce A (a1 / a2 in parallel)** | 3,984 + 3,984 records (group-size 3) | **~7–9 hr** (single-job extrapolation: ~13–18 hr) — *currently RUNNING; numbers will be updated after completion* |
@@ -922,7 +922,7 @@ End-to-end is **GPU-bound on the main chunk batch**. Numbers below come from an 
 | Device-day (d1 / d2 in parallel) | 12 + 12 records | est. ~10–15 min *(pending validation)* |
 | User-day + house-day (parallel, 1 job each) | 6 + 3 records | est. ~5–10 min total *(pending validation)* |
 
-**Total end-to-end (1 GB, 2 GPU nodes, 16 KB chunks):** **~55–60 hours** dominated by the main chunk batch. The chunk batch alone is ~46 hr out of that.
+**Total end-to-end (1 GB, 2 GPU nodes, 16 KB chunks):** **~65–70 hours** dominated by the main chunk batch (59.3 hr out of that). Reduce stages and overhead add the remainder.
 
 **Two factors shape the chunk-batch wall clock:**
 
@@ -936,7 +936,7 @@ End-to-end is **GPU-bound on the main chunk batch**. Numbers below come from an 
 - **Run at smaller scale** (100 MB → ~2,300 chunks at 16 KB cap, ~10× shorter wall-clock at every stage).
 - **Negotiate higher org concurrency** with your platform team — splits scale linearly.
 
-**Beyond 1 GB:** chunk count grows linearly with source size — 10 GB ≈ 230K chunks at 16 KB cap. Even with the 2-job split that's ~460 hours on the chunk batch alone. Past 1 GB the architecture works in principle but isn't practical without higher pod concurrency (4+ way splits), batched-multi-job submission, or per-bucket pre-aggregation.
+**Beyond 1 GB:** chunk count grows linearly with source size — 10 GB ≈ 230K chunks at 16 KB cap. At the observed per-GPU rate (~18.4 s/record, derived from 59:17:46 ÷ 11,625 records per half), 2-way split → ~590 hours on the chunk batch alone. Past 1 GB the architecture works in principle but isn't practical without higher pod concurrency (4+ way splits), batched-multi-job submission, or per-bucket pre-aggregation.
 
 ## 9. Cleanup between runs
 
