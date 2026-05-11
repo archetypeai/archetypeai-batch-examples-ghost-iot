@@ -784,6 +784,20 @@ python 4_download_outputs/download_outputs.py <a2_job_id> outputs/multihome-buck
 cat outputs/multihome-bucket-reduce-a-a1/output_*.jsonl \
     outputs/multihome-bucket-reduce-a-a2/output_*.jsonl \
   > data/predictions_bucket_reduce_a.jsonl
+
+# CRITICAL — renumber line_index sequentially after the concat (see §10.8).
+# Each split job emits line_index relative to its own input (0..N/2-1), so a
+# raw cat produces duplicate line_index values that break downstream prep
+# scripts that join via line_index lookup.
+./myenv/bin/python <<'PY'
+import json
+path = "data/predictions_bucket_reduce_a.jsonl"
+with open(path) as f: lines = f.readlines()
+with open(path, "w") as f:
+    for i, line in enumerate(lines):
+        r = json.loads(line); r["line_index"] = i
+        f.write(json.dumps(r) + "\n")
+PY
 ```
 
 For each `(device, hour)` bucket, Stage A groups the bucket's chunks into packs (up to `--group-size` chunks per pack) and emits one reduce record per group. **We use `--group-size 3`** — empirically the cliff-safe setting in this repo: zero `WARN  ... > 16,384` lines fired during prep on the 1 GB / 16 KB-chunk run, producing **~7,950 partial records** (average ~14 partials per bucket on the dense halves). The script's own default is **4** (lowered from 20 in commit `1086817`), which usually works but is enough to occasionally push a partial-record payload past the 16 KB / ~4K-token quality cliff (§10.6); we go one notch lower for zero-risk margin. Going to 5 or 6 would shave wall-clock further at the cost of more cliff warnings on dense buckets.
@@ -822,6 +836,17 @@ python 4_download_outputs/download_outputs.py <a2_2_job_id> outputs/multihome-bu
 cat outputs/multihome-bucket-reduce-a2-a1/output_*.jsonl \
     outputs/multihome-bucket-reduce-a2-a2/output_*.jsonl \
   > data/predictions_bucket_reduce_a2.jsonl
+
+# Renumber line_index after concat (see §10.8).
+./myenv/bin/python <<'PY'
+import json
+path = "data/predictions_bucket_reduce_a2.jsonl"
+with open(path) as f: lines = f.readlines()
+with open(path, "w") as f:
+    for i, line in enumerate(lines):
+        r = json.loads(line); r["line_index"] = i
+        f.write(json.dumps(r) + "\n")
+PY
 ```
 
 **What it does.** For each `(device, hour)` bucket, sorts Stage A partials by `group_index` and packs them into super-groups of up to 4 partials. Each super-group becomes one inference record — the model produces a "super-partial" narrative summarizing the super-group's 4 partials. Stage B then folds the super-partials, with each bucket containing **≤11 super-partials** (worst case 44 partials / 4 = 11) instead of up to 44 partials. Stage B's per-bucket input now stays comfortably under 16 KB.
@@ -866,6 +891,17 @@ python 4_download_outputs/download_outputs.py <b2_job_id> outputs/multihome-buck
 cat outputs/multihome-bucket-reduce-b-b1/output_*.jsonl \
     outputs/multihome-bucket-reduce-b-b2/output_*.jsonl \
   > data/predictions_per_device_hour.jsonl
+
+# Renumber line_index after concat (see §10.8).
+./myenv/bin/python <<'PY'
+import json
+path = "data/predictions_per_device_hour.jsonl"
+with open(path) as f: lines = f.readlines()
+with open(path, "w") as f:
+    for i, line in enumerate(lines):
+        r = json.loads(line); r["line_index"] = i
+        f.write(json.dumps(r) + "\n")
+PY
 ```
 
 Stage B always emits exactly **576 reduce records** — one per `(device, hour)` bucket — folding that bucket's Stage-A partials into a single device-hour narrative. The output sidecar `manifest_per_device_hour.jsonl` matches the shape the downstream device-day reduce script expects.
@@ -902,6 +938,17 @@ cat outputs/multihome-device-day-a2-a1/output_*.jsonl \
     outputs/multihome-device-day-a2-a2/output_*.jsonl \
   > data/predictions_device_day_a2.jsonl
 
+# Renumber line_index after concat (see §10.8).
+./myenv/bin/python <<'PY'
+import json
+path = "data/predictions_device_day_a2.jsonl"
+with open(path) as f: lines = f.readlines()
+with open(path, "w") as f:
+    for i, line in enumerate(lines):
+        r = json.loads(line); r["line_index"] = i
+        f.write(json.dumps(r) + "\n")
+PY
+
 # ---- Hierarchical Stage B: super-hours → device-day (144 → 24 records) ----
 python 1_prepare_data/prepare_device_day_reduce_a2.py --stage b \
   --predictions data/predictions_device_day_a2.jsonl \
@@ -927,6 +974,18 @@ python 4_download_outputs/download_outputs.py <d2_job_id> outputs/multihome-devi
 cat outputs/multihome-device-day-d1/output_*.jsonl \
     outputs/multihome-device-day-d2/output_*.jsonl \
   > data/predictions_device_day.jsonl
+
+# Renumber line_index after concat — required because prepare_user_day_reduce.py
+# and prepare_house_day_reduce.py both join by line_index lookup (see §10.8).
+./myenv/bin/python <<'PY'
+import json
+path = "data/predictions_device_day.jsonl"
+with open(path) as f: lines = f.readlines()
+with open(path, "w") as f:
+    for i, line in enumerate(lines):
+        r = json.loads(line); r["line_index"] = i
+        f.write(json.dumps(r) + "\n")
+PY
 ```
 
 **What the hierarchical pre-fold does.** For each device, sorts the 24 hourly narratives by hour and packs them into super-hour groups of 4 (e.g., hours 0-3, 4-7, ..., 20-23). Each super-hour group becomes one inference record; the model produces a 4-hour "super-hour summary". The final device-day fold then folds 6 super-hours per device into one daily narrative. Final device-day record size: ≤8 KB per device (was up to 17.8 KB without the pre-fold), comfortably under the cliff.
@@ -1299,6 +1358,31 @@ If the prediction lengths are 0–3 characters, you've crossed the cliff. Re-pre
 **Cause:** when you concatenate the per-chunk single-record JSONLs into one master JSONL and split it into shards (e.g., `_h1.jsonl`, `_h2.jsonl`) — especially if you `shuf` before splitting to balance shard size — the master file's row order no longer matches the sidecar manifest's row order. The output preserves `line_index` relative to *the shuffled input*, not relative to the manifest. A positional join (`manifest[i] ↔ output[i]`) then silently pairs every prediction with the wrong manifest entry.
 
 **Fix:** join by **content** extracted from the input prompt, not by position. Every prompt emitted by `prepare_per_device_hour_jsonls.py` embeds `device_id`, `hour`, `n_flows`, and the chunk's `ts_lo`–`ts_hi` UTC range — enough to uniquely key against the manifest. Add `n_bytes` (from `len(inputs[0].data.encode("utf-8"))` minus the fixed preamble) for the last few percent of collisions when a device has multiple chunks within the same hour. If you never shuffle or split the master JSONL, positional join is safe — but there's no signal that tells you which case you're in, so prefer content-based joining as the default whenever a master JSONL passes through any reordering step.
+
+### 10.8 Concat of split-job predictions creates `line_index` collisions — downstream reduce stages silently use the wrong predictions
+
+**Symptom:** Reduce-stage outputs (user-day, house-day) describe the wrong devices, claim "no activity" for devices that should be busy, or include device names from a different home in another home's narrative. Earlier reduce stages (Stage A → Stage A₂) may look fine, but Stage B and everything after produces wrong content.
+
+**Cause:** This is the GPU-split pattern's hidden hazard. Each split batch job emits an output JSONL with `line_index` values **relative to its own input file** (`0..N/2-1`), not to the original master manifest. When you `cat outputs/*_a1/output_*.jsonl outputs/*_a2/output_*.jsonl > predictions.jsonl`, you end up with **two records per `line_index` value** — one from each half. The downstream prep scripts `prepare_bucket_reduce.py --stage b`, `prepare_user_day_reduce.py`, and `prepare_house_day_reduce.py` load predictions into a `dict[line_index] -> prediction` and look up by `entry["line_index"]`. Dict insertion order means the **last loaded value wins**, so:
+
+- Manifest entries with `line_index 0..N/2-1` get the *second half's* predictions (wrong scope).
+- Manifest entries with `line_index N/2..N-1` get *no prediction at all* (the dict has no key that high) → `predictions.get(li, "")` returns the empty string, which the prep script then folds into the next reduce stage as "(no prediction)".
+
+The hierarchical pre-fold scripts in this repo (`prepare_bucket_reduce_a2.py`, `prepare_device_day_reduce_a2.py`) use `zip(manifest, predictions)` positional pairing instead, so they're not affected. But the existing scripts that use `line_index` lookup are — and that's what feeds the user-day and house-day stages.
+
+**Fix:** renumber `line_index` sequentially in every concat'd predictions file so it matches the manifest's `line_index 0..N-1`. After each `cat outputs/*_a1/... outputs/*_a2/... > predictions.jsonl` step, run:
+
+```python
+import json
+path = "data/predictions_<stage>.jsonl"
+with open(path) as f: lines = f.readlines()
+with open(path, "w") as f:
+    for i, line in enumerate(lines):
+        r = json.loads(line); r["line_index"] = i
+        f.write(json.dumps(r) + "\n")
+```
+
+This is shown after every concat block in §8.6–§8.9. **Skipping it silently breaks every reduce stage downstream**, because the events log will be clean and `Status: COMPLETED` — only the final narratives reveal the problem (wrong device names, "no activity" hallucinations, cross-home leakage). Always inspect at least one final narrative against its manifest scope before trusting the pipeline output.
 
 ## Why this design
 
