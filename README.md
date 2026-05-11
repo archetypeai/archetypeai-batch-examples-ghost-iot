@@ -48,7 +48,10 @@ chunk-slice narratives keyed by manifest file_id
    │ prepare_bucket_reduce.py --stage a   (`--group-size 3` — our cliff-safe default in this repo; script default is 4 — §8.6)
    ▼
 ~7,950 partials at group-size 3 → split in 2 → 2 batch jobs
-   │ prepare_bucket_reduce.py --stage b   (1 record per (device, hour))
+   │ prepare_bucket_reduce_a2.py   (hierarchical pre-fold of busy buckets, group-size 4 — §8.7)
+   ▼
+~2,170 super-partials → split in 2 → 2 batch jobs
+   │ prepare_bucket_reduce.py --stage b   (1 record per (device, hour); reads A₂ predictions/manifest)
    ▼
 576 device-hour narratives → split in 2 → 2 batch jobs
    │ prepare_device_day_reduce.py
@@ -490,13 +493,19 @@ outputs/h1/output_*.jsonl  +  outputs/h2/output_*.jsonl
          ▼  cat outputs/h1/* outputs/h2/* > data/predictions_chunks.jsonl   (concat in order)
          ▼  content-key join to manifest_chunked.jsonl (§10.7)   →   predictions keyed by file_id
          │
-         ▼  prepare_bucket_reduce.py --stage a   (group ≤4 chunks per pack, default; drop to 3 if cliff warning fires)
-data/bucket_reduce_a.jsonl  (~5,800 at group-size 4 / ~7,950 at group-size 3)
+         ▼  prepare_bucket_reduce.py --stage a   (group ≤3 chunks per pack — cliff-safe default in this repo; script default is 4)
+data/bucket_reduce_a.jsonl  (~7,950 at group-size 3)
          │
          ▼  positional split + upload × 2 + create_activity_detection_job × 2  (2 GPUs in parallel)
          ▼  cat outputs → predictions_bucket_reduce_a.jsonl   (positional join — we control the split, no shuffle)
          │
-         ▼  prepare_bucket_reduce.py --stage b   (1 record per (device, hour))
+         ▼  prepare_bucket_reduce_a2.py   (hierarchical pre-fold; group-size 4 — needed because Stage B's straight fold overflows 16 KB on ~17% of buckets without it; see §8.7)
+data/bucket_reduce_a2.jsonl  (~2,170 super-partials)
+         │
+         ▼  positional split + upload × 2 + create_activity_detection_job × 2  (2 GPUs in parallel)
+         ▼  cat outputs → predictions_bucket_reduce_a2.jsonl
+         │
+         ▼  prepare_bucket_reduce.py --stage b   (reads A₂ predictions/manifest; 1 record per (device, hour))
 data/bucket_reduce_b.jsonl  (576 records)  →  split × 2 → 2 batch jobs → cat outputs
          │
          ▼  576 device-hour narratives + manifest_per_device_hour.jsonl
@@ -771,14 +780,62 @@ cat outputs/multihome-bucket-reduce-a-a1/output_*.jsonl \
   > data/predictions_bucket_reduce_a.jsonl
 ```
 
-For each `(device, hour)` bucket, Stage A groups the bucket's chunks into packs (up to `--group-size` chunks per pack) and emits one reduce record per group. **We use `--group-size 3`** — empirically the cliff-safe setting in this repo: zero `WARN  ... > 16,384` lines fired during prep on the 1 GB / 16 KB-chunk run, producing **~7,950 partial records** (average ~14 partials per bucket on the dense halves). The script's own default is **4** (lowered from 20 in commit `1086817`), which usually works but is enough to occasionally push a partial-record payload past the 16 KB / ~4K-token quality cliff (§10.6); we go one notch lower for zero-risk margin. Going to 5 or 6 would shave wall-clock further at the cost of more cliff warnings on dense buckets. Stage B's record count is unchanged regardless (always 576).
+For each `(device, hour)` bucket, Stage A groups the bucket's chunks into packs (up to `--group-size` chunks per pack) and emits one reduce record per group. **We use `--group-size 3`** — empirically the cliff-safe setting in this repo: zero `WARN  ... > 16,384` lines fired during prep on the 1 GB / 16 KB-chunk run, producing **~7,950 partial records** (average ~14 partials per bucket on the dense halves). The script's own default is **4** (lowered from 20 in commit `1086817`), which usually works but is enough to occasionally push a partial-record payload past the 16 KB / ~4K-token quality cliff (§10.6); we go one notch lower for zero-risk margin. Going to 5 or 6 would shave wall-clock further at the cost of more cliff warnings on dense buckets.
 
-### 8.7 Bucket reduce stage B — fold partials into one narrative per bucket (split × 2)
+**One catch — Stage B can't fold all partials directly at this scale.** Stage B's straight concatenation of all per-bucket partials would push **17% of buckets** (98 of 576 at 1 GB / 16 KB chunks) past the 16 KB cliff — the busy buckets (devices/hours with lots of activity) each have 30–44 partials of ~1 KB each. Those are exactly the buckets with the most interesting traffic to summarize, so we can't afford to drop them. §8.7 below inserts a hierarchical re-fold before Stage B.
+
+### 8.7 Bucket reduce stage A₂ — hierarchical pre-fold for busy buckets (split × 2)
 
 ```bash
-python 1_prepare_data/prepare_bucket_reduce.py --stage b \
+# Re-group Stage A partials within each bucket into super-groups of up to 4 partials
+python 1_prepare_data/prepare_bucket_reduce_a2.py \
   --predictions data/predictions_bucket_reduce_a.jsonl \
   --manifest    data/manifest_bucket_reduce_a.jsonl \
+  --output      data/bucket_reduce_a2.jsonl \
+  --output-manifest data/manifest_bucket_reduce_a2.jsonl \
+  --group-size 4
+
+# Positional split (no shuffle)
+./myenv/bin/python <<'PY'
+with open("data/bucket_reduce_a2.jsonl") as f: lines = f.readlines()
+mid = len(lines) // 2
+open("data/bucket_reduce_a2_a1.jsonl", "w").writelines(lines[:mid])
+open("data/bucket_reduce_a2_a2.jsonl", "w").writelines(lines[mid:])
+PY
+
+python 2_upload/upload_multipart.py data/bucket_reduce_a2_a1.jsonl &
+python 2_upload/upload_multipart.py data/bucket_reduce_a2_a2.jsonl &
+wait
+
+python 3_batch_jobs/create_activity_detection_job.py --file bucket_reduce_a2_a1.jsonl --name multihome-bucket-reduce-a2-a1 --max-new-tokens 1024 --model-variant newton/c:2.4.0-7b-base --batch-size 1 --poll-interval 300 &
+python 3_batch_jobs/create_activity_detection_job.py --file bucket_reduce_a2_a2.jsonl --name multihome-bucket-reduce-a2-a2 --max-new-tokens 1024 --model-variant newton/c:2.4.0-7b-base --batch-size 1 --poll-interval 300 &
+wait
+
+python 4_download_outputs/download_outputs.py <a2_1_job_id> outputs/multihome-bucket-reduce-a2-a1
+python 4_download_outputs/download_outputs.py <a2_2_job_id> outputs/multihome-bucket-reduce-a2-a2
+cat outputs/multihome-bucket-reduce-a2-a1/output_*.jsonl \
+    outputs/multihome-bucket-reduce-a2-a2/output_*.jsonl \
+  > data/predictions_bucket_reduce_a2.jsonl
+```
+
+**What it does.** For each `(device, hour)` bucket, sorts Stage A partials by `group_index` and packs them into super-groups of up to 4 partials. Each super-group becomes one inference record — the model produces a "super-partial" narrative summarizing the super-group's 4 partials. Stage B then folds the super-partials, with each bucket containing **≤11 super-partials** (worst case 44 partials / 4 = 11) instead of up to 44 partials. Stage B's per-bucket input now stays comfortably under 16 KB.
+
+**Scale at 1 GB / 16 KB chunks / Stage A group-size 3:**
+- Stage A partials in: 7,968
+- Stage A₂ super-partial records out: **2,171** (median 2 per bucket, p90 = 10, max = 11)
+- Stage B input projection: **0 buckets over 16 KB** (was 98 of 576 without A₂)
+- Wall-clock split: ~1.6–1.7 hr at ~5.5 s/record per GPU (~6× less than Stage A because the input is smaller per record)
+
+**Why group-size 4?** Each super-group input is ≤4 partials × ~1 KB each ≈ ~5 KB — well under the cliff at Stage A₂ inference time. Smaller (e.g., 3) would produce more super-partials per bucket and push some buckets back over Stage B's cliff. Larger (e.g., 6 or 8) would reduce Stage A₂ workload but risk overflowing Stage A₂'s own input cap when worst-case partials are 1.6 KB each. **4 is the sweet spot — validated end-to-end.**
+
+### 8.8 Bucket reduce stage B — fold super-partials into one narrative per bucket (split × 2)
+
+```bash
+# Stage B reads the Stage A₂ super-partials + manifest (NOT Stage A's directly), so each
+# bucket has ≤ ~11 super-partials × ~1 KB instead of up to 44 partials × ~1 KB.
+python 1_prepare_data/prepare_bucket_reduce.py --stage b \
+  --predictions data/predictions_bucket_reduce_a2.jsonl \
+  --manifest    data/manifest_bucket_reduce_a2.jsonl \
   --output      data/bucket_reduce_b.jsonl \
   --output-manifest data/manifest_per_device_hour.jsonl
 
@@ -807,7 +864,7 @@ cat outputs/multihome-bucket-reduce-b-b1/output_*.jsonl \
 
 Stage B always emits exactly **576 reduce records** — one per `(device, hour)` bucket — folding that bucket's Stage-A partials into a single device-hour narrative. The output sidecar `manifest_per_device_hour.jsonl` matches the shape the downstream device-day reduce script expects.
 
-### 8.8 Reduce stage 3: device-day (576 → 24, split × 2)
+### 8.9 Reduce stage 3: device-day (576 → 24, split × 2)
 
 ```bash
 python 1_prepare_data/prepare_device_day_reduce.py \
@@ -841,7 +898,7 @@ cat outputs/multihome-device-day-d1/output_*.jsonl \
 
 Each of the 24 reduce records concatenates that device's 24 hourly narratives in a `=== HOURLY SUMMARIES (24) FOR <device> IN <home> ON <date> ===` envelope, ending with the synthesis instruction. Pack size ≈ 12 KB per record — well under the C model's ~21 KB narrative-heavy ceiling.
 
-### 8.9 Reduce stages 4a/4b: user-day and house-day (24 → {6, 3})
+### 8.10 Reduce stages 4a/4b: user-day and house-day (24 → {6, 3})
 
 Both consume the device-day predictions and run as independent batch jobs. **These are too small to benefit from splitting** (6 and 3 records — queue/setup overhead dominates), so they're each submitted as a single job. The two jobs run in parallel and saturate both GPUs together:
 
@@ -872,9 +929,9 @@ python 4_download_outputs/download_outputs.py <user_day_job_id>  outputs/multiho
 python 4_download_outputs/download_outputs.py <house_day_job_id> outputs/multihome-house-day
 ```
 
-User-day pack size ≈ 3 KB (3 device-day narratives per human), house-day ≈ 8 KB (8 device-day narratives per home) — both fit in C-model context with margin. Output JSONLs land directly in `outputs/multihome-{user,house}-day/` — no extra join step needed since `view_results.py --manifest` consumes the output directory directly (see §8.10).
+User-day pack size ≈ 3 KB (3 device-day narratives per human), house-day ≈ 8 KB (8 device-day narratives per home) — both fit in C-model context with margin. Output JSONLs land directly in `outputs/multihome-{user,house}-day/` — no extra join step needed since `view_results.py --manifest` consumes the output directory directly (see §8.11).
 
-### 8.10 View results
+### 8.11 View results
 
 ```bash
 python 4_download_outputs/download_outputs.py <user_day_job_id>  outputs/multihome-user-day
@@ -896,7 +953,8 @@ python 5_view_results/view_results.py outputs/multihome-house-day --manifest dat
 |---|---|---|---|
 | Chunk inference | **~23,250 at `--max-chunk-bytes 16384`** (recommended) | ≤16 KB (~4K tokens) per chunk | `--max-chunk-bytes` |
 | Bucket reduce A (intra-bucket) | **~7,950 at `--group-size 3`** (our cliff-safe setting); ~5,800 at the script default of 4 | ≤16 KB (~4K tok) — sized to stay under quality cliff | `--group-size` × per-chunk narrative length |
-| Bucket reduce B (per-bucket) | 576 | ~3-8 KB | partial narrative length × group_count |
+| Bucket reduce A₂ (hierarchical pre-fold; §8.7) | **~2,170 super-partials** at `--group-size 4` | ≤16 KB — re-folds Stage A partials into ≤11 super-partials per bucket | needed because Stage B's straight fold overflows 16 KB on ~17% of buckets without it |
+| Bucket reduce B (per-bucket) | 576 | ≤12 KB (worst-case 11 super-partials × ~1 KB) — under cliff with A₂ pre-fold | super-partial narrative length × super_group_count per bucket |
 | Device-day reduce | 24 | ~12 KB | 24 × hourly narrative length |
 | User-day reduce | 6 | ~3 KB | 3 × device-day narrative length |
 | House-day reduce | 3 | ~8 KB | 8 × device-day narrative length |
@@ -918,6 +976,7 @@ End-to-end is **GPU-bound on the main chunk batch**. Numbers below come from an 
 | Download + concat + content-key join | — | ~5 min |
 | Bucket reduce A prep | — | ~10 s |
 | **Bucket reduce A (a1 / a2 in parallel)** | 3,984 + 3,984 records (group-size 3) | **6:10:23** (≈ 6.17 hr observed at ~5.5 s/record per GPU; single-job extrapolation: ~12.2 hr; split saves ~6 hr) |
+| **Bucket reduce A₂ (a2-1 / a2-2 in parallel)** | 1,085 + 1,086 records (group-size 4) | est. **~1.6–1.7 hr** *(currently RUNNING; numbers will be updated after completion)* |
 | Bucket reduce B (b1 / b2 in parallel) | 288 + 288 records | est. ~1.5–2 hr *(pending validation)* |
 | Device-day (d1 / d2 in parallel) | 12 + 12 records | est. ~10–15 min *(pending validation)* |
 | User-day + house-day (parallel, 1 job each) | 6 + 3 records | est. ~5–10 min total *(pending validation)* |
