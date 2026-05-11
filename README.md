@@ -54,7 +54,10 @@ chunk-slice narratives keyed by manifest file_id
    │ prepare_bucket_reduce.py --stage b   (1 record per (device, hour); reads A₂ predictions/manifest)
    ▼
 576 device-hour narratives → split in 2 → 2 batch jobs
-   │ prepare_device_day_reduce.py
+   │ prepare_device_day_reduce_a2.py --stage a   (hierarchical pre-fold: 4 hours per super-hour group — §8.9)
+   ▼
+144 super-hour records → split in 2 → 2 batch jobs
+   │ prepare_device_day_reduce_a2.py --stage b   (fold super-hours into device-day)
    ▼
 24 device-day narratives → split in 2 → 2 batch jobs
    ├─► prepare_user_day_reduce.py  ─►  6 user-day narratives (1 batch job — too small to split usefully)
@@ -510,7 +513,10 @@ data/bucket_reduce_b.jsonl  (576 records)  →  split × 2 → 2 batch jobs → 
          │
          ▼  576 device-hour narratives + manifest_per_device_hour.jsonl
          │
-         ▼  prepare_device_day_reduce.py  (group by device)
+         ▼  prepare_device_day_reduce_a2.py --stage a  (hierarchical pre-fold: 4 hours per super-hour — §8.9)
+1 JSONL × 144 super-hour records  →  split × 2 → 2 batch jobs → cat outputs
+         │
+         ▼  prepare_device_day_reduce_a2.py --stage b  (fold super-hours into device-day)
 1 JSONL × 24 records  →  split × 2 → 2 batch jobs → cat outputs  →  24 device-day narratives
          │
          ├─►  prepare_user_day_reduce.py   (group by human, personal devices only)
@@ -864,31 +870,58 @@ cat outputs/multihome-bucket-reduce-b-b1/output_*.jsonl \
 
 Stage B always emits exactly **576 reduce records** — one per `(device, hour)` bucket — folding that bucket's Stage-A partials into a single device-hour narrative. The output sidecar `manifest_per_device_hour.jsonl` matches the shape the downstream device-day reduce script expects.
 
-### 8.9 Reduce stage 3: device-day (576 → 24, split × 2)
+### 8.9 Reduce stage 3: device-day (576 → 24, hierarchical pre-fold + split × 2)
+
+The naive prep (`prepare_device_day_reduce.py`) concatenates all 24 hourly narratives for each device into one record. **At 1 GB the busiest device's 24-hour pack is 17,855 B — barely past the 16 KB cliff.** Other 23 devices are fine (max 16 KB). Rather than risk silent garbage on the busy device, we do a hierarchical pre-fold (same shape as Stage A₂ in §8.7): pre-fold 24 hours into 6 super-hour groups of 4 hours each, then fold the 6 super-hours into one device-day narrative.
 
 ```bash
-python 1_prepare_data/prepare_device_day_reduce.py \
+# ---- Hierarchical Stage A: hours → super-hours (576 → 144 records) ----
+python 1_prepare_data/prepare_device_day_reduce_a2.py --stage a \
   --predictions data/predictions_per_device_hour.jsonl \
   --manifest    data/manifest_per_device_hour.jsonl \
+  --output      data/device_day_reduce_a2.jsonl \
+  --output-manifest data/manifest_device_day_a2.jsonl \
+  --group-size 4
+
+# Positional split + upload + 2 jobs (72 + 72 records)
+./myenv/bin/python <<'PY'
+with open("data/device_day_reduce_a2.jsonl") as f: lines = f.readlines()
+mid = len(lines) // 2
+open("data/device_day_reduce_a2_a1.jsonl", "w").writelines(lines[:mid])
+open("data/device_day_reduce_a2_a2.jsonl", "w").writelines(lines[mid:])
+PY
+python 2_upload/upload_multipart.py data/device_day_reduce_a2_a1.jsonl &
+python 2_upload/upload_multipart.py data/device_day_reduce_a2_a2.jsonl &
+wait
+python 3_batch_jobs/create_activity_detection_job.py --file device_day_reduce_a2_a1.jsonl --name multihome-device-day-a2-a1 --max-new-tokens 1024 --model-variant newton/c:2.4.0-7b-base --batch-size 1 --poll-interval 60 &
+python 3_batch_jobs/create_activity_detection_job.py --file device_day_reduce_a2_a2.jsonl --name multihome-device-day-a2-a2 --max-new-tokens 1024 --model-variant newton/c:2.4.0-7b-base --batch-size 1 --poll-interval 60 &
+wait
+python 4_download_outputs/download_outputs.py <a1_job_id> outputs/multihome-device-day-a2-a1
+python 4_download_outputs/download_outputs.py <a2_job_id> outputs/multihome-device-day-a2-a2
+cat outputs/multihome-device-day-a2-a1/output_*.jsonl \
+    outputs/multihome-device-day-a2-a2/output_*.jsonl \
+  > data/predictions_device_day_a2.jsonl
+
+# ---- Hierarchical Stage B: super-hours → device-day (144 → 24 records) ----
+python 1_prepare_data/prepare_device_day_reduce_a2.py --stage b \
+  --predictions data/predictions_device_day_a2.jsonl \
+  --manifest    data/manifest_device_day_a2.jsonl \
   --output      data/device_day_reduce.jsonl \
   --output-manifest data/manifest_device_day.jsonl
 
-# Positional split: 12 + 12
+# Split + upload + 2 jobs (12 + 12 records)
 ./myenv/bin/python <<'PY'
 with open("data/device_day_reduce.jsonl") as f: lines = f.readlines()
-mid = len(lines) // 2  # 12
+mid = len(lines) // 2
 open("data/device_day_reduce_d1.jsonl", "w").writelines(lines[:mid])
 open("data/device_day_reduce_d2.jsonl", "w").writelines(lines[mid:])
 PY
-
 python 2_upload/upload_multipart.py data/device_day_reduce_d1.jsonl &
 python 2_upload/upload_multipart.py data/device_day_reduce_d2.jsonl &
 wait
-
-python 3_batch_jobs/create_activity_detection_job.py --file device_day_reduce_d1.jsonl --name multihome-device-day-d1 --max-new-tokens 2048 --batch-size 1 --poll-interval 60 &
-python 3_batch_jobs/create_activity_detection_job.py --file device_day_reduce_d2.jsonl --name multihome-device-day-d2 --max-new-tokens 2048 --batch-size 1 --poll-interval 60 &
+python 3_batch_jobs/create_activity_detection_job.py --file device_day_reduce_d1.jsonl --name multihome-device-day-d1 --max-new-tokens 2048 --model-variant newton/c:2.4.0-7b-base --batch-size 1 --poll-interval 60 &
+python 3_batch_jobs/create_activity_detection_job.py --file device_day_reduce_d2.jsonl --name multihome-device-day-d2 --max-new-tokens 2048 --model-variant newton/c:2.4.0-7b-base --batch-size 1 --poll-interval 60 &
 wait
-
 python 4_download_outputs/download_outputs.py <d1_job_id> outputs/multihome-device-day-d1
 python 4_download_outputs/download_outputs.py <d2_job_id> outputs/multihome-device-day-d2
 cat outputs/multihome-device-day-d1/output_*.jsonl \
@@ -896,7 +929,21 @@ cat outputs/multihome-device-day-d1/output_*.jsonl \
   > data/predictions_device_day.jsonl
 ```
 
-Each of the 24 reduce records concatenates that device's 24 hourly narratives in a `=== HOURLY SUMMARIES (24) FOR <device> IN <home> ON <date> ===` envelope, ending with the synthesis instruction. Pack size ≈ 12 KB per record — well under the C model's ~21 KB narrative-heavy ceiling.
+**What the hierarchical pre-fold does.** For each device, sorts the 24 hourly narratives by hour and packs them into super-hour groups of 4 (e.g., hours 0-3, 4-7, ..., 20-23). Each super-hour group becomes one inference record; the model produces a 4-hour "super-hour summary". The final device-day fold then folds 6 super-hours per device into one daily narrative. Final device-day record size: ≤8 KB per device (was up to 17.8 KB without the pre-fold), comfortably under the cliff.
+
+**Why `--group-size 4` for hours?** 4 hours × ~700 B per hourly summary ≈ ~3 KB super-hour input — well under the cliff at Stage A. 6 super-hours × ~1 KB per super-hour summary ≈ ~6 KB device-day input — also well under. If your Stage B hourly summaries are longer (above ~1 KB each), drop to `--group-size 3` for safety; if they're shorter (~500 B), `--group-size 6` works and produces fewer Stage A records.
+
+**Alternative — naive (no pre-fold).** If every device's 24-hour pack fits under 16 KB (verify before running with `prepare_device_day_reduce.py` and inspecting the warning output), you can skip the pre-fold:
+
+```bash
+python 1_prepare_data/prepare_device_day_reduce.py \
+  --predictions data/predictions_per_device_hour.jsonl \
+  --manifest    data/manifest_per_device_hour.jsonl \
+  --output      data/device_day_reduce.jsonl \
+  --output-manifest data/manifest_device_day.jsonl
+```
+
+Then jump straight to the split + upload + 2 jobs block. At 1 GB / 16 KB chunks this fails on the busiest device, so we use the hierarchical path; at smaller scales (≤100 MB) where every device fits, the naive path saves one batch round-trip.
 
 ### 8.10 Reduce stages 4a/4b: user-day and house-day (24 → {6, 3})
 
@@ -955,7 +1002,8 @@ python 5_view_results/view_results.py outputs/multihome-house-day --manifest dat
 | Bucket reduce A (intra-bucket) | **~7,950 at `--group-size 3`** (our cliff-safe setting); ~5,800 at the script default of 4 | ≤16 KB (~4K tok) — sized to stay under quality cliff | `--group-size` × per-chunk narrative length |
 | Bucket reduce A₂ (hierarchical pre-fold; §8.7) | **~2,170 super-partials** at `--group-size 4` | ≤16 KB — re-folds Stage A partials into ≤11 super-partials per bucket | needed because Stage B's straight fold overflows 16 KB on ~17% of buckets without it |
 | Bucket reduce B (per-bucket) | 576 | ≤12 KB (worst-case 11 super-partials × ~1 KB) — under cliff with A₂ pre-fold | super-partial narrative length × super_group_count per bucket |
-| Device-day reduce | 24 | ~12 KB | 24 × hourly narrative length |
+| Device-day Stage A (hierarchical pre-fold; §8.9) | 144 super-hour records | ≤5 KB — 4 hourly narratives per super-hour group | needed when ≥1 device's 24-hour pack exceeds 16 KB (busiest device at 1 GB was 17.8 KB) |
+| Device-day Stage B (final) | 24 | ≤8 KB (6 super-hour narratives × ~1 KB) — under cliff with pre-fold | super-hour narrative length × super_hour_count per device |
 | User-day reduce | 6 | ~3 KB | 3 × device-day narrative length |
 | House-day reduce | 3 | ~8 KB | 8 × device-day narrative length |
 
@@ -978,7 +1026,8 @@ End-to-end is **GPU-bound on the main chunk batch**. Numbers below come from an 
 | **Bucket reduce A (a1 / a2 in parallel)** | 3,984 + 3,984 records (group-size 3) | **6:10:23** (≈ 6.17 hr observed at ~5.5 s/record per GPU; single-job extrapolation: ~12.2 hr; split saves ~6 hr) |
 | **Bucket reduce A₂ (a2-1 / a2-2 in parallel)** | 1,085 + 1,086 records (group-size 4) | **1:37:51** (≈ 1.63 hr observed at ~5.4 s/record per GPU; single-job extrapolation: ~3.25 hr; split saves ~1.6 hr) |
 | **Bucket reduce B (b1 / b2 in parallel)** | 288 + 288 records | **0:23:07** (≈ 23 min observed at ~5 s/record per GPU; single-job extrapolation: ~48 min; split saves ~24 min) — much faster than estimated because per-record Stage B inputs are small (median 800 B, max 12 KB after A₂) |
-| Device-day (d1 / d2 in parallel) | 12 + 12 records | est. ~10–15 min *(pending validation)* |
+| Device-day Stage A (a1 / a2 in parallel; §8.9 hierarchical) | 72 + 72 super-hour records | est. ~6–8 min *(currently RUNNING; updated after completion)* |
+| Device-day Stage B (d1 / d2 in parallel) | 12 + 12 records | est. ~2–3 min *(pending validation)* |
 | User-day + house-day (parallel, 1 job each) | 6 + 3 records | est. ~5–10 min total *(pending validation)* |
 
 **Total end-to-end (1 GB, 2 GPU nodes, 16 KB chunks):** **~65–70 hours** dominated by the main chunk batch (59.3 hr out of that). Reduce stages and overhead add the remainder.
