@@ -53,3 +53,4 @@ data/ghost_iot_*_yesterday_[0-9]*.jsonl
 
 # Stale temp files from older prep scripts
 data/tmp*.flows
+EXPERIENCE.md
