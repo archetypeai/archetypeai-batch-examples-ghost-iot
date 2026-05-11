@@ -1026,7 +1026,7 @@ End-to-end is **GPU-bound on the main chunk batch**. Numbers below come from an 
 | **Bucket reduce A (a1 / a2 in parallel)** | 3,984 + 3,984 records (group-size 3) | **6:10:23** (≈ 6.17 hr observed at ~5.5 s/record per GPU; single-job extrapolation: ~12.2 hr; split saves ~6 hr) |
 | **Bucket reduce A₂ (a2-1 / a2-2 in parallel)** | 1,085 + 1,086 records (group-size 4) | **1:37:51** (≈ 1.63 hr observed at ~5.4 s/record per GPU; single-job extrapolation: ~3.25 hr; split saves ~1.6 hr) |
 | **Bucket reduce B (b1 / b2 in parallel)** | 288 + 288 records | **0:23:07** (≈ 23 min observed at ~5 s/record per GPU; single-job extrapolation: ~48 min; split saves ~24 min) — much faster than estimated because per-record Stage B inputs are small (median 800 B, max 12 KB after A₂) |
-| Device-day Stage A (a1 / a2 in parallel; §8.9 hierarchical) | 72 + 72 super-hour records | est. ~6–8 min *(currently RUNNING; updated after completion)* |
+| **Device-day Stage A (a1 / a2 in parallel; §8.9 hierarchical)** | 72 + 72 super-hour records | **0:08:02** (≈ 8 min observed at ~6.7 s/record per GPU; single-job extrapolation: ~16 min; split saves ~8 min) |
 | Device-day Stage B (d1 / d2 in parallel) | 12 + 12 records | est. ~2–3 min *(pending validation)* |
 | User-day + house-day (parallel, 1 job each) | 6 + 3 records | est. ~5–10 min total *(pending validation)* |
 
