@@ -824,7 +824,7 @@ cat outputs/multihome-bucket-reduce-a2-a1/output_*.jsonl \
 - Stage A partials in: 7,968
 - Stage A₂ super-partial records out: **2,171** (median 2 per bucket, p90 = 10, max = 11)
 - Stage B input projection: **0 buckets over 16 KB** (was 98 of 576 without A₂)
-- Wall-clock split: ~1.6–1.7 hr at ~5.5 s/record per GPU (~6× less than Stage A because the input is smaller per record)
+- Wall-clock split: **1:37:51 observed** at ~5.4 s/record per GPU (~6× less than Stage A's 6:10:23 — fewer records, similar per-record speed)
 
 **Why group-size 4?** Each super-group input is ≤4 partials × ~1 KB each ≈ ~5 KB — well under the cliff at Stage A₂ inference time. Smaller (e.g., 3) would produce more super-partials per bucket and push some buckets back over Stage B's cliff. Larger (e.g., 6 or 8) would reduce Stage A₂ workload but risk overflowing Stage A₂'s own input cap when worst-case partials are 1.6 KB each. **4 is the sweet spot — validated end-to-end.**
 
@@ -976,7 +976,7 @@ End-to-end is **GPU-bound on the main chunk batch**. Numbers below come from an 
 | Download + concat + content-key join | — | ~5 min |
 | Bucket reduce A prep | — | ~10 s |
 | **Bucket reduce A (a1 / a2 in parallel)** | 3,984 + 3,984 records (group-size 3) | **6:10:23** (≈ 6.17 hr observed at ~5.5 s/record per GPU; single-job extrapolation: ~12.2 hr; split saves ~6 hr) |
-| **Bucket reduce A₂ (a2-1 / a2-2 in parallel)** | 1,085 + 1,086 records (group-size 4) | est. **~1.6–1.7 hr** *(currently RUNNING; numbers will be updated after completion)* |
+| **Bucket reduce A₂ (a2-1 / a2-2 in parallel)** | 1,085 + 1,086 records (group-size 4) | **1:37:51** (≈ 1.63 hr observed at ~5.4 s/record per GPU; single-job extrapolation: ~3.25 hr; split saves ~1.6 hr) |
 | Bucket reduce B (b1 / b2 in parallel) | 288 + 288 records | est. ~1.5–2 hr *(pending validation)* |
 | Device-day (d1 / d2 in parallel) | 12 + 12 records | est. ~10–15 min *(pending validation)* |
 | User-day + house-day (parallel, 1 job each) | 6 + 3 records | est. ~5–10 min total *(pending validation)* |
