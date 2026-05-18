@@ -598,24 +598,26 @@ These two settings together let chunks up to ~16 KB run cleanly. **`batch_size: 
 
 Even when per-line context fits the platform's 16,384-token budget AND batch initialization succeeds, **the model degrades into table-completion mode** when the input is dominated by tabular/CSV-style data above a content-shape-dependent threshold. No warning fires; the platform reports `0 failed`; the predictions are 1-3 character fragments like `'00'`, `'|153|'`, or empty strings. This is exactly the failure mode wifi-multi observed at ~18.5 KB for `/query` ([their "Constraints driving the design"](https://github.com/archetypeai/query-examples-wifi-multi/#constraints-driving-the-design)).
 
-**Empirical sweep at 1 GB (May 2026), 5-record probe per cap, `bs=1`, `model_variant=newton/c:2.4.0-7b-base`, `max_new_tokens=1024`:**
+**Empirical sweep at 1 GB, 5-record probe per cap, `bs=1`, `max_new_tokens=1024`. The `c2.4.0-7b` column is the original May 2026 prod sweep; the `c2.5.0-8b` column was re-run May 2026 on prod side-by-side after the model became available, using the same uploaded test files:**
 
-| `--max-chunk-bytes` cap | Avg `inputs[0].data` | ~Tokens (data)¹ | `WARN inference.truncation`? | Output quality |
-|---|---|---|---|---|
-| 10240 (10 KB) | 10.4 KB | ~2.5k | None | **Real narratives** ✓ |
-| 12288 (12 KB) | 12.4 KB | ~3k | None | **Real narratives** ✓ |
-| **16384 (16 KB) — recommended** | 16.5 KB | **~4k** (last good) | None | **Real narratives** ✓ (richer than 12 KB — more specific volume numbers, peak-hour observations) |
-| 20480 (20 KB) | 20.6 KB | ~5k | None | ✗ Garbage (`'72\|1'`, `'0'`, `''`) |
-| 24576 (24 KB) | 24.5 KB | ~6k | None | ✗ Garbage |
-| 28672 (28 KB) | 28.8 KB | ~7k | None | ✗ Garbage |
-| 32768 (32 KB) | 32.7 KB | ~8k | None | ✗ Garbage (`'00'`, `'801'`) |
-| 36864 (36 KB) | 37.0 KB | ~9k | None | ✗ Garbage |
-| 40960 (40 KB) | 41.1 KB | ~10k | **Yes — every record** | ✗ Garbage |
-| 49152 (48 KB) | 48.4 KB | ~12k | Yes | ✗ Garbage |
-| 53248 (52 KB) | 53.4 KB | ~13k | Yes | ✗ Garbage |
-| 55296 (54 KB) | 55.4 KB | ~14k | Yes | ✗ Garbage |
-| 61440 (60 KB) | 61.6 KB | ~15k | Yes | ✗ Garbage |
-| 65536 (64 KB) | 65.7 KB | ~16k | Yes | ✗ Garbage |
+| `--max-chunk-bytes` cap | Avg `inputs[0].data` | ~Tokens (data)¹ | `WARN inference.truncation`? | Quality — `newton/c:2.4.0-7b-base` | Quality — `newton/c:2.5.0-8b-base` |
+|---|---|---|---|---|---|
+| 10240 (10 KB) | 10.4 KB | ~2.5k | None | **Real narratives** ✓ | — (not re-tested) |
+| 12288 (12 KB) | 12.4 KB | ~3k | None | **Real narratives** ✓ | — (not re-tested) |
+| **16384 (16 KB) — recommended** | 16.5 KB | **~4k** (last good) | None | **Real narratives** ✓ (richer than 12 KB — more specific volume numbers, peak-hour observations) | **Real narratives** ✓ (mean 3,322 chars) |
+| 20480 (20 KB) | 20.6 KB | ~5k | None | ✗ Garbage (`'72\|1'`, `'0'`, `''`) | ✗ Garbage (mean 31 chars, pipe-rows like `'00000001\|DNS\|...'`) |
+| 24576 (24 KB) | 24.5 KB | ~6k | None | ✗ Garbage | — (not re-tested) |
+| 28672 (28 KB) | 28.8 KB | ~7k | None | ✗ Garbage | — (not re-tested) |
+| 32768 (32 KB) | 32.7 KB | ~8k | None | ✗ Garbage (`'00'`, `'801'`) | ✗ Garbage (mean 23 chars) |
+| 36864 (36 KB) | 37.0 KB | ~9k | None | ✗ Garbage | — (not re-tested) |
+| 40960 (40 KB) | 41.1 KB | ~10k | **Yes — every record** | ✗ Garbage | — (not re-tested) |
+| 49152 (48 KB) | 48.4 KB | ~12k | Yes | ✗ Garbage | ✗ Garbage (mean 27 chars; `token_budget=16,384` WARN fires) |
+| 53248 (52 KB) | 53.4 KB | ~13k | Yes | ✗ Garbage | — (not re-tested) |
+| 55296 (54 KB) | 55.4 KB | ~14k | Yes | ✗ Garbage | — (not re-tested) |
+| 61440 (60 KB) | 61.6 KB | ~15k | Yes | ✗ Garbage | — (not re-tested) |
+| 65536 (64 KB) | 65.7 KB | ~16k | Yes | ✗ Garbage | ✗ Garbage (mean 39 chars; `token_budget=16,384` WARN fires) |
+
+**Bottom line: both models cliff at the same place.** Same quality cliff between 16.5 KB and 20.6 KB of `inputs[0].data`, same nominal `token_budget=16,384`, same silent-garbage failure mode below the truncation-WARN threshold. The `--max-chunk-bytes 16384` recommendation carries over to `newton/c:2.5.0-8b-base` unchanged — c2.5.0-8b spits ~30-40 chars of pipe-row garbage past the cliff vs. c2.4.0's 0-6 chars (slightly more verbose, same failure mode). The same 5-cap sweep against staging produced identical results, so this is a model+tokenizer property, not an environment artifact.
 
 ¹ **Tokens column uses ~0.25 tok/byte** (generic 4 chars/token), which matches the quality cliff — empirically, **~4k tokens of flow data is the last good size**. The platform's own tokenizer for pipe-separated flow rows is denser (~0.4 tok/byte), and that's what drives the *truncation* cliff at ~41 KB (~16k tokens of actual context spend, exceeding the 16,384 ctx − 1024 out − ~200 prompt budget — see observation 1 below). The two cliffs are independent: the **quality cliff** (~4k tokens / 16 KB) is a small-model coherence limit and fires silently; the **truncation cliff** (~16k tokens / 41 KB) is a context-length limit and emits a warning.
 
