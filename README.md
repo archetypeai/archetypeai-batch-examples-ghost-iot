@@ -752,6 +752,36 @@ with open("data/predictions_chunks_raw.jsonl") as f, \
 
 The content key is `(device_id, hour, n_flows, ts_lo, ts_hi, n_bytes)`. At 1 GB / 16 KB cap, **23,249 of 23,249** chunks join cleanly (6 latent collisions out of 23,249 — 0.03%; the `n_bytes` term disambiguates). See §10.7 for the rationale.
 
+#### Sanity check the concat — what one good run looks like
+
+After §8.5's `cat` + `line_index` renumber, inspect the result so you know the chunks job actually produced narratives (and didn't silently cliff). One run of the **May 2026 c2.5.0-8b** pipeline on the same 1 GB dataset:
+
+|                          |                                              |
+|---|---|
+| Records concat'd         | **23,249** (11,625 + 11,624)                 |
+| `line_index`             | contiguous 0..23248 ✓                        |
+| Empties (< 100 chars)    | **0** ✓                                      |
+| Prediction chars (mean)  | **3,312** (median 3,314, max 4,549)          |
+| Output file              | `data/predictions_chunks_c25_8b.jsonl`       |
+
+**Quality signal vs the c2.4.0-7b run on identical inputs:** c2.5.0-8b mean prediction = **3,312 chars** vs c2.4.0's ~2,634 chars — **~26% longer narratives**, matching the "slightly more verbose at the cliff" pattern §8.2's 5-cap sweep already showed. Sample predictions read as well-structured markdown analyses with proper protocol breakdowns; **0 cliff failures** across all 23,249 records. The clean signature here is:
+
+- **0 empties / sub-100-char predictions** (no `'00'`, `'|153|'` cliff artifacts).
+- **Mean prediction length in the few-thousand-char range** (not the 1-3 char range that would indicate cliff).
+
+**Recommended: run [`3_batch_jobs/audit_predictions.py`](3_batch_jobs/audit_predictions.py)** after every stage's concat to automate this check — it prints length percentiles, counts the four §10.6 cliff signatures (`< 100 chars`, `100–500 chars`, `starts-with-pipe-row`, `contains flow-log preamble`), classifies ending styles, and **exits non-zero if cliff signatures fire on > 1% of records** so you can wire it into shell scripts to fail fast:
+
+```bash
+python3 3_batch_jobs/audit_predictions.py data/predictions_chunks.jsonl
+
+# Side-by-side against a baseline (different model variant, or a prior run):
+python3 3_batch_jobs/audit_predictions.py data/predictions_chunks_c25_8b.jsonl \
+  --label "c2.5.0-8b" \
+  --baseline data/predictions_chunks_4k.jsonl --baseline-label "c2.4.0-7b"
+```
+
+If your run lands in this ballpark, §8.5 succeeded and you can move to §8.6.
+
 ### 8.6 Bucket reduce stage A — group chunks into per-bucket partials (split × 2)
 
 ```bash
