@@ -1104,24 +1104,37 @@ Chunk count scales linearly with source size at the recommended 16 KB cap (~250 
 
 ### Wall-clock at 1 GB (observed)
 
-End-to-end is **GPU-bound on the main chunk batch**. Numbers below come from an actual run against `pipeline: activity-detection v1.1.1-409-e749ac0` (May 2026, `model_variant: newton/c:2.4.0-7b-base`, `batch_size: 1`, `max_new_tokens: 1024`, `--max-chunk-bytes 16384`). Every stage uses the **2-job split pattern** ("Stage X-1 / Stage X-2" running in parallel on 2 GPU nodes — see §8 intro bullet 3):
+End-to-end is **GPU-bound on the main chunk batch**. Two complete end-to-end runs have been done against `pipeline: activity-detection v1.1.1-409-e749ac0`, both with `batch_size: 1`, `max_new_tokens: 1024` (`2048` for device-day, user-day, house-day), `--max-chunk-bytes 16384`, and the **2-job split pattern** (see §8 intro bullet 3):
 
-| Stage | Records (h1+h2 split) | Observed wall clock |
-|---|---|---|
-| Generate 1 GB CSV | — | ~40 s |
-| Per-chunk prep + concat + split | ~23K chunks (16 KB cap) | ~2–3 min |
-| Multipart upload × 2 (parallel) | 2 × ~200 MB | ~1–2 min |
-| **Main chunk batch (h1 / h2 in parallel)** | 11,625 + 11,624 records | **59:17:46** (≈ 59.3 hr observed; single-job extrapolation: ~118 hr; split saves ~59 hr) |
-| Download + concat + content-key join | — | ~5 min |
-| Bucket reduce A prep | — | ~10 s |
-| **Bucket reduce A (a1 / a2 in parallel)** | 3,984 + 3,984 records (group-size 3) | **6:10:23** (≈ 6.17 hr observed at ~5.5 s/record per GPU; single-job extrapolation: ~12.2 hr; split saves ~6 hr) |
-| **Bucket reduce A₂ (a2-1 / a2-2 in parallel)** | 1,085 + 1,086 records (group-size 4) | **1:37:51** (≈ 1.63 hr observed at ~5.4 s/record per GPU; single-job extrapolation: ~3.25 hr; split saves ~1.6 hr) |
-| **Bucket reduce B (b1 / b2 in parallel)** | 288 + 288 records | **0:23:07** (≈ 23 min observed at ~5 s/record per GPU; single-job extrapolation: ~48 min; split saves ~24 min) — much faster than estimated because per-record Stage B inputs are small (median 800 B, max 12 KB after A₂) |
-| **Device-day Stage A (a1 / a2 in parallel; §8.9 hierarchical)** | 72 + 72 super-hour records | **0:08:02** (≈ 8 min observed at ~6.7 s/record per GPU; single-job extrapolation: ~16 min; split saves ~8 min) |
-| **Device-day Stage B (d1 / d2 in parallel)** | 12 + 12 records | **0:03:51** (≈ 3:51 observed at ~9.6 s/record per GPU; slightly higher per-record time because max_new_tokens=2048 for richer daily narratives) |
-| **User-day + house-day (parallel, 1 job each)** | 6 + 3 records | **0:02:38** (user-day) / **0:02:36** (house-day) — both ran simultaneously; ~26 s/record average across both jobs at max_new_tokens=2048 |
+- **c2.4.0-7b (May 2026):** `model_variant: newton/c:2.4.0-7b-base` — original baseline run.
+- **c2.5.0-8b (May 2026):** `model_variant: newton/c:2.5.0-8b-base` — re-run after c2.5.0-8b became available on prod.
 
-**Total end-to-end (1 GB, 2 GPU nodes, 16 KB chunks): ~67.7 hours** observed end-to-end. Breakdown: chunk batch 59.3 hr (87.6%) + Stage A 6.17 hr (9.1%) + Stage A₂ 1.63 hr (2.4%) + Stage B 0.39 hr (0.6%) + device-day Stage A 0.13 hr (0.2%) + device-day Stage B 0.06 hr (0.1%) + user/house-day 0.04 hr (0.06%) + ~15 min of prep/upload/download overhead.
+| Stage | Records (h1+h2 split) | c2.4.0-7b wall-clock | c2.5.0-8b wall-clock |
+|---|---|---|---|
+| Generate 1 GB CSV | — | ~40 s | (reused) |
+| Per-chunk prep + concat + split | ~23K chunks (16 KB cap) | ~2–3 min | (reused) |
+| Multipart upload × 2 (parallel) | 2 × ~200 MB | ~1–2 min | (reused — same file_ids) |
+| **Main chunk batch (h1 / h2 in parallel)** | 11,625 + 11,624 records | **59:17:46** (~59.3 hr at ~18.4 s/rec per GPU) | **~123:42** (~123.7 hr at ~**38.3 s/rec** per GPU — **2.08× slower per record**) |
+| Download + concat + content-key join | — | ~5 min | ~5 min |
+| Bucket reduce A prep | — | ~10 s | ~10 s |
+| **Bucket reduce A (a1 / a2 in parallel)** | 3,984 + 3,984 records (group-size 3) | **6:10:23** (~6.17 hr at ~5.5 s/rec per GPU) | **~5:30** (~5.5 hr at ~5.0 s/rec per GPU — **slightly faster**) |
+| **Bucket reduce A₂ (a2-1 / a2-2 in parallel)** | 1,085 + 1,086 records (group-size 4) | **1:37:51** (~1.63 hr at ~5.4 s/rec per GPU) | **~1:45** (~1.75 hr at ~5.8 s/rec per GPU) |
+| **Bucket reduce B (b1 / b2 in parallel)** | 288 + 288 records | **0:23:07** (~23 min at ~5 s/rec per GPU) | **~0:30** (~30 min) |
+| **Device-day Stage A (a1 / a2 in parallel; §8.9 hierarchical)** | 72 + 72 super-hour records | **0:08:02** (~8 min at ~6.7 s/rec per GPU) | **~0:13** (~13 min at ~8.5 s/rec per GPU) |
+| **Device-day Stage B (d1 / d2 in parallel)** | 12 + 12 records | **0:03:51** | **~0:04** |
+| **User-day + house-day (parallel, 1 job each)** | 6 + 3 records | **0:02:38** / **0:02:36** | **~0:04** combined (244 s observed end-to-end) |
+
+**Total end-to-end (1 GB, 2 GPU nodes, 16 KB chunks):**
+- **c2.4.0-7b: ~67.7 hours** observed (chunk batch 59.3 hr = 87.6% of total; reduce stages 8.4 hr; ~15 min prep/overhead).
+- **c2.5.0-8b: ~131.5 hours** observed (chunk batch 123.7 hr = 94.1% of total; reduce stages 7.7 hr; ~15 min prep/overhead).
+
+**Comparison observations:**
+
+1. **The chunks batch is the only stage where c2.5.0-8b is meaningfully slower** — 2.08× per record vs. c2.4.0. ~14% comes from the param-size bump (7B → 8B) and ~15% from longer outputs (mean 3,312 chars vs. 2,744). The remaining **~1.55× residual** is unexplained by model arithmetic alone; suspects are serving-stack differences (precision/quantization, GPU SKU pool, speculative decoding availability, continuous batching at `bs=1`). Open question with the platform team; see also the standalone reproducer script `3_batch_jobs/repro_model_timing.py`.
+
+2. **All reduce stages run at near-c2.4.0-7b speed or only slightly slower** — they decode shorter English outputs (~3-6 sentences vs. the chunks job's full markdown analysis), so the per-output-token tax that hurts the chunks job doesn't compound here. The chunks-job slowdown does NOT extrapolate to the whole pipeline; reduce stages stayed within 10-20% of baseline.
+
+3. **No cliff failures and zero `BackoffLimitExceeded` retries on the c2.5.0-8b end-to-end run** (after an early infra-level eviction was resolved by the platform team re-tainting nodes — see §10.6 below). Audit harness `3_batch_jobs/audit_predictions.py` returned `✓ OK` at every stage.
 
 **Two factors shape the chunk-batch wall clock:**
 
