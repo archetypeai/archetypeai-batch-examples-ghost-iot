@@ -138,7 +138,7 @@ def avg_row_bytes(fieldnames, rows, sample_size: int = 1000):
     w.writeheader()
     header_len = buf.tell()
     buf.seek(0); buf.truncate()
-    sample = rows if len(rows) <= sample_size else random.sample(rows, sample_size)
+    sample = rows if len(rows) <= sample_size else rows[:sample_size]
     w.writerows(sample)
     return buf.tell() / max(1, len(sample)), header_len
 
@@ -146,6 +146,7 @@ def avg_row_bytes(fieldnames, rows, sample_size: int = 1000):
 def main():
     args = parse_args()
     rng = random.Random(args.seed)
+    random.seed(args.seed)
 
     seed_csv = args.seed_csv if os.path.isabs(args.seed_csv) else os.path.join(REPO_DIR, args.seed_csv)
     output = args.output if os.path.isabs(args.output) else os.path.join(REPO_DIR, args.output)
