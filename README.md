@@ -63,8 +63,8 @@ The full field dictionary is `Description of fields.pdf` in the [dataset reposit
 ## 1. Setup
 
 ```bash
-git clone https://github.com/archetypeai/archetypeai-batch-examples-ghost-iot.git
-cd archetypeai-batch-examples-ghost-iot
+git clone https://github.com/archetypeai/batch-example-activity-detection-ghost-iot.git
+cd batch-example-activity-detection-ghost-iot
 
 cp .env.example .env          # then set ATAI_API_KEY
 python3 -m venv myenv
