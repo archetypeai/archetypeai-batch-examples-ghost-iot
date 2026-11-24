@@ -13,11 +13,11 @@ Section 7 scales the same idea to synthetic multi-home data: GB of flows, folded
 |---|---|
 | Platform | Archetype AI platform API 2.0 (`https://platform.u1.archetypeai.app/api`) |
 | Pipeline | `activity-detection` (batch) |
-| Default model | `newton/c:2.5.1-8b-base` (Newton C 2.5.1 8B) |
-| Optional model | `newton/c:2.6.0-8b-fp8-base` (Newton C 2.6 8B FP8): pass `--model-variant` |
+| Default model | `newton/c:2.6.0-8b-fp8-base` (Newton C 2.6 8B FP8), set by the scripts |
+| Other model | `newton/c:2.5.1-8b-base` (Newton C 2.5.1 8B, the platform's default): pass `--model-variant newton/c:2.5.1-8b-base` |
 | Largest record that gives a real narrative | **~16 KB** of flow log on C 2.5.1 (16,384-token context), **~32 KB** on C 2.6 ([§9.3](#93-oversized-records-garbage-on-c-251-inference-error-on-c-26)) |
 
-C 2.6 FP8 is about twice as fast per record (17 s against 37 s for the home-level record) and takes twice the input, so it is the better choice for large runs. Both models produce comparable narratives on these examples.
+The scripts default to C 2.6 because it is faster and takes twice the input. On the full multi-home run its 716 near-full 16 KB records took 22 minutes against 5 h 15 min on C 2.5.1 ([§7](#7-scale-multi-home-map-reduce)), and the home-level record here takes 17 s against 37 s. Both models produce comparable narratives on these examples. The scripts always send `model_variant`, so a change of the platform's default doesn't change your results.
 
 ## Pipeline
 
@@ -136,9 +136,9 @@ python 3_batch_jobs/create_activity_detection_job.py --file ghost_iot_home_yeste
 # Devices: 5 prompts -> 5 narratives
 python 3_batch_jobs/create_activity_detection_job.py --file ghost_iot_devices_yesterday.jsonl
 
-# Same job on Newton C 2.6 FP8
+# Same job on Newton C 2.5.1
 python 3_batch_jobs/create_activity_detection_job.py --file ghost_iot_devices_yesterday.jsonl \
-  --model-variant newton/c:2.6.0-8b-fp8-base
+  --model-variant newton/c:2.5.1-8b-base
 ```
 
 The script creates the job, polls it to a terminal status, prints the event log, and prints the download command. A job takes about 5 minutes, mostly queueing and model loading; the home record itself takes 37 s on C 2.5.1 and 17 s on C 2.6.
@@ -152,13 +152,14 @@ The request it sends:
   "pipeline_key": "activity-detection",
   "inputs": {"worker.data": [{"file_id": "ghost_iot_home_yesterday.jsonl"}]},
   "parameters": {"worker": {"parallelism": 1, "config": {
+    "model_variant": "newton/c:2.6.0-8b-fp8-base",
     "generation": {"do_sample": true, "max_new_tokens": 1024, "temperature": 0.7,
                    "top_k": 20, "top_p": 0.8, "repetition_penalty": 1}
   }}}
 }
 ```
 
-`--model-variant` adds `config.model_variant`.
+`--model-variant` sets `config.model_variant`; the shell script reads it from `MODEL_VARIANT`.
 
 **Long runs:** the upload script, the job script and `run_multihome.py` take `--background [LOG]`. It relaunches the same command under `nohup` (it keeps going if the terminal closes) and, on macOS, `caffeinate -i` (the Mac doesn't sleep until it ends), prints the pid and the `tail -f` and `kill` commands, and writes all output to LOG (default `outputs/logs/<script>.log`). Stopping the script doesn't cancel a job already on the platform: cancel it with `POST /api/batch/jobs/{job_id}/cancel`.
 
@@ -201,12 +202,12 @@ A real deployment sees many homes, people and devices, and far more flows than f
 python 1_prepare_data/generate_synthetic_multihome_csv.py --target-size-mb 12 \
   --output data/wifi_flows_multihome_12mb.csv
 
-# 2a. Quick run: one home, Newton C 2.6, detached
+# 2a. Quick run: one home, detached (about 1 hour)
 python run_multihome.py --csv data/wifi_flows_multihome_12mb.csv --run quick \
-  --homes home_a --model-variant newton/c:2.6.0-8b-fp8-base --background
+  --homes home_a --background
 tail -f outputs/logs/run_multihome.log
 
-# 2b. Full run: all three homes on the default model (about 6 hours; see below)
+# 2b. Full run: all three homes (about 1 h 15 min; see below)
 python run_multihome.py --csv data/wifi_flows_multihome_12mb.csv --run mh12 --background
 
 # 3. Read the results (replace quick with your --run)
@@ -230,7 +231,7 @@ The stages, each one batch job:
 
 **Every flow is used.** Chunking splits each device-hour at the byte cap and never samples or truncates; every later stage folds narratives from the stage before. Only the first stages grow with the data: a 1 GB CSV makes about 23,000 chunks, folded by `bucket_a` and `bucket_a2` into the same 576 device-hours.
 
-**Time is set by records, not megabytes.** Every record writes a narrative of up to 1,024 tokens (2,048 from `device_day` on), and every input has 24 devices × 24 hours, so even a tiny CSV makes 576 device-hours to fold. Each later stage takes at least 5–10 minutes however few records it has, so the seven reduce stages add about an hour. `--homes home_a` keeps a third of the records at every stage.
+**Time is set by records, not megabytes.** Every record writes a narrative of up to 1,024 tokens (2,048 from `device_day` on), and every input has 24 devices × 24 hours, so even a tiny CSV makes 576 device-hours to fold. Each later stage takes at least 5–10 minutes however few records it has, so the seven reduce stages add 45–60 minutes. `--homes home_a` keeps a third of the records at every stage.
 
 **One job per stage.** Each stage's input is one JSONL, so output `line_index` equals the input line and every stage joins to its manifest by position. Each stage's job id is saved in `data/multihome/<run>/jobs.json` as soon as the job is created. Rerunning the same command (with the same `--homes`) skips finished stages and waits on a job that is still running, so a run survives a closed terminal or a reboot. Artifacts go to `data/multihome/<run>/` and `outputs/<run>/`.
 
@@ -239,9 +240,10 @@ Measured on Prod (November 2026), 12 MB CSV:
 | Run | Model | `chunks` stage | Whole run |
 |---|---|---|---|
 | `--homes home_a` (902 records) | C 2.6 | 14 min (267 chunks) | 1 h 00 min |
+| all 3 homes (2,621 records) | C 2.6 | 22 min (716 chunks) | about 1 h 10 min |
 | all 3 homes (2,621 records) | C 2.5.1 | 5 h 15 min (716 chunks) | 6 h 22 min |
 
-Times depend on how busy the platform is. At 1 GB (about 23,000 chunks), expect days on C 2.5.1; on C 2.6, `--max-chunk-bytes 32768` halves the chunk count.
+On C 2.6 every stage after `chunks` took 5–7 minutes, mostly queueing and model loading. Times depend on how busy the platform is. At 1 GB (about 23,000 chunks), expect several hours on C 2.6 and days on C 2.5.1; on C 2.6, `--max-chunk-bytes 32768` halves the chunk count.
 
 ## 8. Cleanup
 

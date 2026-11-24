@@ -95,9 +95,15 @@ def create_job(payload: dict) -> dict:
 
 
 def get_job(job_id: str) -> dict:
-    resp = requests.get(f"{BASE_URL}/batch/jobs/{job_id}", headers=AUTH)
-    resp.raise_for_status()
-    return resp.json()
+    """Fetch a job, retrying through network drops (a laptop going offline)."""
+    while True:
+        try:
+            resp = requests.get(f"{BASE_URL}/batch/jobs/{job_id}", headers=AUTH, timeout=60)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.ConnectionError, requests.Timeout) as e:
+            print(f"  poll failed, retrying in 30 s: {e}", flush=True)
+            time.sleep(30)
 
 
 def get_events(job_id: str) -> list:
@@ -130,11 +136,11 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=1024,
                         help="Maximum tokens Newton may generate per record (default: 1024). "
                              "Bump to 2048+ for reduce calls that need to synthesize multi-paragraph summaries.")
-    parser.add_argument("--model-variant", default=None,
-                        help="Newton C model via parameters.worker.config.model_variant. "
-                             "Unset = platform default (newton/c:2.5.1-8b-base). "
-                             "'newton/c:2.6.0-8b-fp8-base' is ~2x faster and handles records up to "
-                             "~32 KB; larger records fail with 'inference error' (README §10.6).")
+    parser.add_argument("--model-variant", default="newton/c:2.6.0-8b-fp8-base",
+                        help="Newton C model via parameters.worker.config.model_variant "
+                             "(default: newton/c:2.6.0-8b-fp8-base, records up to ~32 KB). "
+                             "'newton/c:2.5.1-8b-base' is the platform default: slower, records up to ~16 KB "
+                             "(README §9.3).")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Cap the engine's batch size via parameters.worker.config.batch_size. "
                              "Unset = the engine calibrates its own batch size (recommended).")

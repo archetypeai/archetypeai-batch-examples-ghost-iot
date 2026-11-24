@@ -9,7 +9,7 @@ line, so each stage joins to its manifest by position (no split, no renumbering)
 
 Usage:
     python run_multihome.py --csv data/wifi_flows_multihome_12mb.csv --run mh12
-    python run_multihome.py --csv ... --run mh12 --model-variant newton/c:2.6.0-8b-fp8-base
+    python run_multihome.py --csv ... --run mh12 --model-variant newton/c:2.5.1-8b-base
     python run_multihome.py --csv ... --run quick --homes home_a   # 1 home: a third of the records
     python run_multihome.py --csv ... --run mh12 --background     # detached; tail -f outputs/logs/run_multihome.log
 
@@ -53,9 +53,14 @@ def wait_for(job_id: str) -> str:
     import requests
     last = None
     while True:
-        resp = requests.get(f"{BASE_URL}/batch/jobs/{job_id}", headers=AUTH, timeout=60)
-        resp.raise_for_status()
-        job = resp.json()
+        try:
+            resp = requests.get(f"{BASE_URL}/batch/jobs/{job_id}", headers=AUTH, timeout=60)
+            resp.raise_for_status()
+            job = resp.json()
+        except (requests.ConnectionError, requests.Timeout) as e:
+            print(f"  {time.strftime('%H:%M:%S')} poll failed, retrying: {e}", flush=True)
+            time.sleep(30)
+            continue
         if job["status"] != last:
             print(f"  {time.strftime('%H:%M:%S')} {job_id} {job['status']}", flush=True)
             last = job["status"]
@@ -100,9 +105,10 @@ def batch(src: str, stage: str, run_id: str, max_new_tokens: int, model_variant:
                 jobs[stage] = job_id
                 json.dump(jobs, open(jobs_path, "w"), indent=1)
                 print(f"  {stage}: job {job_id}", flush=True)
-        if proc.wait() != 0 or not job_id:
+        if not job_id:
             sys.exit(f"{stage}: job script failed:\n{''.join(out)[-2000:]}")
-        status = re.search(r"Status: (\w+)", "".join(out)).group(1)
+        m = re.search(r"Status: (\w+)", "".join(out)) if proc.wait() == 0 else None
+        status = m.group(1) if m else wait_for(job_id)
     if status != "COMPLETED":
         sys.exit(f"{stage}: job {job_id} ended {status}. To start this stage over, "
                  f"remove \"{stage}\" from {os.path.relpath(jobs_path, REPO)} and rerun.")
@@ -132,7 +138,7 @@ def main() -> None:
     ap.add_argument("--csv", required=True, help="Multi-home flows CSV (generate_synthetic_multihome_csv.py)")
     ap.add_argument("--run", required=True, help="Run id: names the directory, files and jobs")
     ap.add_argument("--max-chunk-bytes", type=int, default=16384, help="Chunk cap (default 16 KB, see §10.6)")
-    ap.add_argument("--model-variant", default=None, help="Passed to every batch job (default: platform default)")
+    ap.add_argument("--model-variant", default="newton/c:2.6.0-8b-fp8-base", help="Passed to every batch job (default: %(default)s)")
     ap.add_argument("--homes", nargs="+", metavar="HOME_ID",
                     help="Only these homes from data/topology.json (home_a, home_b, home_c); flows of other "
                          "homes are skipped. One home is a third of the records in every stage.")

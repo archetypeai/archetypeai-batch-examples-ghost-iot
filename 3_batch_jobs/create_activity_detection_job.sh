@@ -27,12 +27,14 @@ else
 fi
 
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+MODEL_VARIANT="${MODEL_VARIANT:-newton/c:2.6.0-8b-fp8-base}"
 
 echo "============================================================"
 echo " Archetype AI Activity Detection Job (Shell)"
 echo "============================================================"
 echo " file_id: $FILE_ID"
 echo " name:    $JOB_NAME"
+echo " model:   $MODEL_VARIANT"
 echo
 
 echo "[1/3] Creating activity detection job..."
@@ -51,6 +53,7 @@ JOB_RESPONSE=$(/usr/bin/curl -s -X POST "$BASE_URL/batch/jobs" \
       \"worker\": {
         \"parallelism\": 1,
         \"config\": {
+          \"model_variant\": \"$MODEL_VARIANT\",
           \"generation\": {
             \"do_sample\": true,
             \"max_new_tokens\": $MAX_NEW_TOKENS,

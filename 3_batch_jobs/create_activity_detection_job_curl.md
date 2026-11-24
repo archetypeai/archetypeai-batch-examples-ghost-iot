@@ -37,6 +37,7 @@ curl -s -X POST "$BASE_URL/batch/jobs" \
       "worker": {
         "parallelism": 1,
         "config": {
+          "model_variant": "newton/c:2.6.0-8b-fp8-base",
           "generation": {
             "do_sample": true,
             "max_new_tokens": 1024,
@@ -68,6 +69,7 @@ curl -s -X POST "$BASE_URL/batch/jobs" \
       "worker": {
         "parallelism": 1,
         "config": {
+          "model_variant": "newton/c:2.6.0-8b-fp8-base",
           "generation": {
             "do_sample": true,
             "max_new_tokens": 1024,
