@@ -16,8 +16,7 @@ Two modes:
            --manifest data/manifest_device_day.jsonl
 
 The positional argument accepts either a directory of raw output JSONL files
-(`inp_*_output.jsonl`) or a joined predictions JSONL produced by
-4_download_outputs/extract_predictions.py. When `--manifest` is supplied,
+(`inp_*_output.jsonl`) or a predictions JSONL written by run_multihome.py. When `--manifest` is supplied,
 each prediction is labeled with its scope (home, human, device, hour) drawn
 from the sidecar.
 """
@@ -105,7 +104,7 @@ def main():
     parser = argparse.ArgumentParser(description="Pretty-print Activity Detection outputs.")
     parser.add_argument("source",
                         help="Directory of output JSONL files OR a joined predictions JSONL "
-                             "(from 4_download_outputs/extract_predictions.py).")
+                             "(from run_multihome.py).")
     parser.add_argument("--input", default=None,
                         help="Original input JSONL — used (in non-manifest mode) to label "
                              "predictions with the prompt's MAC.")

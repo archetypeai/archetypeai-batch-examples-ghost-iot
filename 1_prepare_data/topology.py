@@ -14,7 +14,8 @@ import os
 from dataclasses import dataclass
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_TOPOLOGY_JSON = os.path.join(REPO_DIR, "data", "topology.json")
+# TOPOLOGY_JSON overrides the file, e.g. a one-home subset written by run_multihome.py --homes.
+DEFAULT_TOPOLOGY_JSON = os.environ.get("TOPOLOGY_JSON") or os.path.join(REPO_DIR, "data", "topology.json")
 
 
 @dataclass(frozen=True)

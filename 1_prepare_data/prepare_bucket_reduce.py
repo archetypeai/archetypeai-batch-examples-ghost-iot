@@ -143,7 +143,7 @@ def main():
                         help="a = intra-bucket grouping (chunks → partials); "
                              "b = bucket finalization (partials → 1 narrative per bucket)")
     parser.add_argument("--predictions", required=True,
-                        help="Joined predictions JSONL from extract_predictions.py "
+                        help="Predictions JSONL written by run_multihome.py "
                              "(stage a reads chunk predictions, stage b reads stage-a predictions).")
     parser.add_argument("--manifest", required=True,
                         help="Sidecar manifest JSONL matching --predictions.")
