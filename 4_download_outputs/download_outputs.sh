@@ -19,6 +19,14 @@ JOB_ID="${1:?Usage: $0 <job_id> [output_dir]}"
 OUTPUT_DIR="${2:-outputs/$JOB_ID}"
 mkdir -p "$OUTPUT_DIR"
 
+# view_results.py reads every file in the folder; refuse to mix in other jobs' outputs.
+OTHERS=$(find "$OUTPUT_DIR" -maxdepth 1 -name '*.jsonl' ! -name "${JOB_ID}__*" | wc -l | tr -d ' ')
+if [ "$OTHERS" -gt 0 ]; then
+    echo "$OUTPUT_DIR/ already holds $OTHERS output file(s) from other jobs." >&2
+    echo "view_results.py would mix them with this job's. Remove them or pick an empty folder." >&2
+    exit 1
+fi
+
 echo "============================================================"
 echo " Download Batch Job Outputs (Shell)"
 echo "============================================================"
@@ -50,6 +58,13 @@ p = json.load(sys.stdin)
 print(p['next_cursor'] if p.get('has_more') and p.get('next_cursor') else '')")
     [ -n "$AFTER" ] || break
 done
+
+if [ "$DOWNLOADED" -eq 0 ]; then
+    echo "No outputs to download. Check the job's status and error (README §9.1):" >&2
+    /usr/bin/curl -s "$BASE_URL/batch/jobs/$JOB_ID" -H "Authorization: Bearer $ATAI_API_KEY" \
+      | python3 -c "import sys, json; j = json.load(sys.stdin); print(' ', j.get('status'), j.get('error'))" >&2
+    exit 1
+fi
 
 FILE_COUNT=$(ls -1 "$OUTPUT_DIR" | wc -l | tr -d ' ')
 TOTAL_SIZE=$(du -sh "$OUTPUT_DIR" | awk '{print $1}')
