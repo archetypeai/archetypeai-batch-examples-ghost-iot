@@ -298,7 +298,7 @@ Keep records at 16 KB or less on C 2.5.1 (a 16 KB chunk of flow log is about 15,
 
 File names are unique per org: uploading a name that exists returns 409, and the scripts skip the upload and reuse the existing file. **That file may hold different content** if you changed the local file since. To replace it, rename the local file, or delete the old one with `python cleanup.py --remote` (`DELETE /api/files/{file_uid}`).
 
-An upload that dies after `initiate` leaves its name in `UPLOADING`, and that name returns 409 until the platform expires it. The upload scripts abort on failure to prevent this; if it happens anyway, upload under a new name.
+An upload that dies after `initiate` can leave its name stuck in `UPLOADING`. That name keeps returning 409, jobs on it fail with `could not read input` ([§9.1](#91-completed-with-failed-inputs)), and on Prod it can't be deleted (DELETE returns 404). The upload scripts abort on failure to prevent this, and `upload_multipart.py` reports a stuck name instead of skipping it. If it happens, upload under a new name.
 
 ### 9.5 Reading the event log
 

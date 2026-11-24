@@ -113,7 +113,7 @@ def batch(src: str, stage: str, run_id: str, max_new_tokens: int, model_variant:
         sys.exit(f"{stage}: job {job_id} ended {status}. To start this stage over, "
                  f"remove \"{stage}\" from {os.path.relpath(jobs_path, REPO)} and rerun.")
 
-    out_dir = os.path.join(REPO, "outputs", run_id, stage)
+    out_dir = os.path.join(REPO, "outputs", run_id, stage, job_id)  # one folder per job: reruns never mix
     run([PY, os.path.join(REPO, "4_download_outputs/download_outputs.py"), job_id, out_dir])
     preds = []
     for fn in sorted(os.listdir(out_dir)):
@@ -123,7 +123,7 @@ def batch(src: str, stage: str, run_id: str, max_new_tokens: int, model_variant:
     errors = [p for p in preds if p.get("error") or not p.get("prediction")]
     print(f"  {stage}: {len(preds)}/{n_in} predictions, {len(errors)} errors (job {job_id})", flush=True)
     if len(preds) != n_in or len(errors) > 0.01 * n_in:
-        sys.exit(f"{stage}: too many missing or failed records; see outputs/{run_id}/{stage}/")
+        sys.exit(f"{stage}: too many missing or failed records; see {os.path.relpath(out_dir, REPO)}/")
     return preds
 
 
@@ -164,6 +164,8 @@ def main() -> None:
     elif os.path.exists(p("topology.json")):
         sys.exit(f"run {a.run} was started with --homes; pass the same --homes to resume it")
 
+    ran = []  # stages that ran a job this time
+
     def stage(key: str, build: list[str] | None, src: str, tokens: int) -> str:
         """Build `src` with `build` (a prep command), batch it, write predictions."""
         out = p(f"predictions_{key}.jsonl")
@@ -171,6 +173,7 @@ def main() -> None:
             print(f"[{key}] done already: {os.path.relpath(out, REPO)}")
             return out
         print(f"\n[{key}]", flush=True)
+        ran.append(key)
         if build:
             run(build)
         preds = batch(src, key, a.run, tokens, a.model_variant)
@@ -223,6 +226,9 @@ def main() -> None:
                     "--output", p(f"{key}.jsonl"), "--output-manifest", p(f"manifest_{key}.jsonl")],
               p(f"{key}.jsonl"), 2048)
 
+    if not ran:
+        print(f"\nNothing new ran: run '{a.run}' had already finished, so these are its earlier results.\n"
+              f"To run the pipeline again on Prod, pick a new name, e.g. --run {a.run}-2")
     print(f"\nDone. View the narratives with:\n"
           f"  python 5_view_results/view_results.py data/multihome/{a.run}/predictions_house_day.jsonl "
           f"--manifest data/multihome/{a.run}/manifest_house_day.jsonl")
