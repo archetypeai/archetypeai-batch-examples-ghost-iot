@@ -43,6 +43,9 @@ from datetime import datetime, timezone
 
 from topology import REPO_DIR, load_topology
 
+sys.path.insert(0, REPO_DIR)
+from background import add_background_flag, maybe_detach  # noqa: E402
+
 DEFAULT_DATE = "2019-10-19"
 DEFAULT_SEED_CSV = os.path.join(REPO_DIR, "data", "wlan0_ipv4_flows_db.csv")
 DEFAULT_OUTPUT_CSV = os.path.join(REPO_DIR, "data", "wifi_flows_multihome_1gb.csv")
@@ -114,7 +117,10 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42, help="RNG seed (default: %(default)s)")
     p.add_argument("--no-jitter", action="store_true", help="Disable byte/packet jitter")
     p.add_argument("--keep-empty-macs", action="store_true", help="Keep seed rows with empty mac_a/mac_b")
-    return p.parse_args()
+    add_background_flag(p, default_log="outputs/logs/generate_csv.log")
+    args = p.parse_args()
+    maybe_detach(args)
+    return args
 
 
 def load_seed(seed_csv: str, keep_empty_macs: bool):

@@ -161,7 +161,7 @@ The request it sends:
 
 `--model-variant` sets `config.model_variant`; the shell script reads it from `MODEL_VARIANT`.
 
-**Long runs:** the upload script, the job script and `run_multihome.py` take `--background [LOG]`. It relaunches the same command under `nohup` (it keeps going if the terminal closes) and, on macOS, `caffeinate -i` (the Mac doesn't sleep until it ends), prints the pid and the `tail -f` and `kill` commands, and writes all output to LOG (default `outputs/logs/<script>.log`). Stopping the script doesn't cancel a job already on the platform: cancel it with `POST /api/batch/jobs/{job_id}/cancel`.
+**Long runs:** the upload script, the job script, `run_multihome.py` and the CSV generator take `--background [LOG]`. It relaunches the same command under `nohup` (it keeps going if the terminal closes) and, on macOS, `caffeinate -i` (the Mac doesn't sleep until it ends), prints the pid and the `tail -f` and `kill` commands, and writes all output to LOG (default `outputs/logs/<script>.log`). Stopping the script doesn't cancel a job already on the platform: cancel it with `POST /api/batch/jobs/{job_id}/cancel`. `caffeinate` doesn't stop sleep when you close the lid; the scripts retry through a dropped connection, and rerunning `run_multihome.py` reattaches to its jobs.
 
 ```bash
 python 3_batch_jobs/create_activity_detection_job.py --file ghost_iot_devices_yesterday.jsonl --background
@@ -177,6 +177,8 @@ python 4_download_outputs/download_outputs.py <home_job_id>   outputs/home
 python 4_download_outputs/download_outputs.py <device_job_id> outputs/devices
 # or: ./4_download_outputs/download_outputs.sh <job_id> outputs/home
 ```
+
+The job script prints these two commands with the job id filled in. The download stops if the folder already holds another job's outputs, because `view_results.py` reads every file in it; empty the folder or pick another. A job whose inputs all failed has no outputs, and the download says so with the job's error.
 
 Each output line is `{"line_index": 0, "prediction": "..."}`, in input order. A record that failed has `"prediction": null` and an `"error"`. curl walkthrough: [4_download_outputs/download_outputs_curl.md](4_download_outputs/download_outputs_curl.md).
 
@@ -201,6 +203,7 @@ A real deployment sees many homes, people and devices, and far more flows than f
 # 1. Synthesize a multi-home CSV (reproducible with --seed)
 python 1_prepare_data/generate_synthetic_multihome_csv.py --target-size-mb 12 \
   --output data/wifi_flows_multihome_12mb.csv
+#    (for a 1 GB CSV: --target-size-gb 1 --output data/wifi_flows_multihome_1gb.csv --background)
 
 # 2a. Quick run: one home, detached (about 1 hour)
 python run_multihome.py --csv data/wifi_flows_multihome_12mb.csv --run quick \

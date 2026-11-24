@@ -279,8 +279,12 @@ def main():
         print(f" Error:     {job['error']}")
     print("=" * 60)
     print()
-    print("Next: download outputs with")
-    print(f"  python 4_download_outputs/download_outputs.py {job_id} outputs/{name}")
+    out_dir = {"ghost_iot_home_yesterday.jsonl": "outputs/home",
+               "ghost_iot_devices_yesterday.jsonl": "outputs/devices"}.get(file_ids[0] if len(file_ids) == 1 else "",
+                                                                          f"outputs/{name}")
+    print("Next: download and view the outputs with")
+    print(f"  python 4_download_outputs/download_outputs.py {job_id} {out_dir}")
+    print(f"  python 5_view_results/view_results.py {out_dir}")
 
 
 if __name__ == "__main__":

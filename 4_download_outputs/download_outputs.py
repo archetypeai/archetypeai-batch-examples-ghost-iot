@@ -16,7 +16,9 @@ import time
 # Config
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from atai_api import fetch_ref, list_all  # noqa: E402
+import requests  # noqa: E402
+
+from atai_api import AUTH, BASE_URL, fetch_ref, list_all  # noqa: E402
 
 
 def get_outputs(job_id: str) -> list:
@@ -41,6 +43,15 @@ def main():
     output_dir = sys.argv[2] if len(sys.argv) > 2 else f"outputs/{job_id}"
     os.makedirs(output_dir, exist_ok=True)
 
+    # view_results.py reads every file in the folder, so files from another
+    # job would be shown as if they came from this one.
+    others = sorted(f for f in os.listdir(output_dir)
+                    if f.endswith(".jsonl") and not f.startswith(f"{job_id}__"))
+    if others:
+        sys.exit(f"{output_dir}/ already holds {len(others)} output file(s) from other jobs "
+                 f"(e.g. {others[0]}).\nview_results.py would mix them with this job's. "
+                 f"Remove them or pick an empty folder.")
+
     print("=" * 60)
     print(" Download Batch Job Outputs")
     print("=" * 60)
@@ -53,6 +64,11 @@ def main():
     outputs = get_outputs(job_id)
     print(f"  Total: {len(outputs)} files")
     print()
+    if not outputs:
+        job = requests.get(f"{BASE_URL}/batch/jobs/{job_id}", headers=AUTH, timeout=60).json()
+        sys.exit(f"No outputs to download. Job status: {job.get('status')}; "
+                 f"error: {job.get('error') or 'none'}.\nIf every input failed, the job's "
+                 f"event log says why (README §9.1).")
 
     # Step 2: Download files
     print(f"[2/2] Downloading {len(outputs)} files...")
