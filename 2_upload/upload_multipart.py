@@ -6,9 +6,9 @@ Usage:
     python upload_multipart.py data/volve_inference.csv
 
 Flow:
-    1. POST /v0.5/files/uploads/initiate  -> get presigned URLs
+    1. POST /api/files/uploads/initiate  -> get presigned URLs
     2. PUT each part to S3                 -> collect ETags
-    3. POST /v0.5/files/uploads/{id}/complete -> finalize
+    3. POST /api/files/uploads/{id}/complete -> finalize
 """
 
 import json
@@ -21,18 +21,9 @@ import requests
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
-with open(ENV_PATH) as f:
-    for line in f:
-        line = line.strip()
-        if "=" in line and not line.startswith("#"):
-            k, v = line.split("=", 1)
-            os.environ[k] = v
-
-API_KEY = os.environ["ATAI_API_KEY"]
-API_ENDPOINT = os.environ["ATAI_API_ENDPOINT"]
-BASE_URL = f"{API_ENDPOINT}/v0.5"
-AUTH = {"Authorization": f"Bearer {API_KEY}"}
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from atai_api import AUTH, BASE_URL  # noqa: E402
+from background import add_background_flag, maybe_detach  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -81,9 +72,9 @@ def progress_bar(current: int, total: int, width: int = 40) -> str:
 class FileAlreadyExists(Exception):
     """Raised when /files/uploads/initiate returns HTTP 409 Conflict because
     a file with the same filename has already been uploaded under this org.
-    The platform doesn't expose a per-file delete endpoint, so the only
-    options are: skip the re-upload (file is already there), rename the local
-    file, or use a different filename when calling initiate_upload."""
+    Options: skip the re-upload (the file is already there), rename the local
+    file, or delete the old one first (DELETE /api/files/{file_uid}, or
+    `python cleanup.py --remote`)."""
 
     def __init__(self, filename: str, response_body: str = ""):
         self.filename = filename
@@ -144,7 +135,9 @@ def main():
                              "application/x-ndjson. Getting this wrong is the most "
                              "common cause of `(item count unknown) → Processing "
                              "failed` later — see README §10.1.")
+    add_background_flag(parser, default_log="outputs/logs/upload.log")
     args = parser.parse_args()
+    maybe_detach(args)
 
     file_path = args.file_path
     file_size = os.path.getsize(file_path)
@@ -171,8 +164,8 @@ def main():
         print( "  Skipping upload — you can reference it directly in batch jobs:")
         print(f"      python 3_batch_jobs/create_activity_detection_job.py --file {exc.filename}")
         print()
-        print( "  If you need to upload a fresh copy, rename your local file first")
-        print( "  (the platform does not expose a per-file delete endpoint).")
+        print( "  To upload a fresh copy, rename your local file, or delete the old")
+        print( "  one first with DELETE /api/files/{file_uid} (see cleanup.py --remote).")
         sys.exit(0)
 
     required = ("upload_id", "file_uid", "num_parts", "parts")
@@ -186,21 +179,17 @@ def main():
         print( "  Likely causes: the file is in a partial-upload state on the platform")
         print( "  (e.g. an earlier session uploaded but didn't complete), or the API has")
         print( "  changed shape. If the file is partially uploaded, try aborting via")
-        print( "  POST /v0.5/files/uploads/{upload_id}/abort or use a different filename.")
+        print( "  POST /api/files/uploads/{upload_id}/abort or use a different filename.")
         sys.exit(1)
 
     upload_id = init["upload_id"]
     file_uid = init["file_uid"]
-    strategy = init.get("strategy", "unknown")
     num_parts = init["num_parts"]
-    part_size = init.get("part_size", file_size)
     parts = init["parts"]
 
     print(f"      upload_id : {upload_id}")
     print(f"      file_uid  : {file_uid}")
-    print(f"      strategy  : {strategy}")
-    print(f"      parts     : {num_parts} x {fmt_bytes(part_size)}")
-    print(f"      expires_at: {init.get('expires_at', 'N/A')}")
+    print(f"      parts     : {num_parts}")
     print()
 
     # --- Step 2: Upload parts ------------------------------------------------

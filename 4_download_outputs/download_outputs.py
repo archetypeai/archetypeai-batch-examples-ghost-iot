@@ -11,53 +11,25 @@ import os
 import sys
 import time
 
-import requests
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
-with open(ENV_PATH) as f:
-    for line in f:
-        line = line.strip()
-        if "=" in line and not line.startswith("#"):
-            k, v = line.split("=", 1)
-            os.environ[k] = v
-
-API_KEY = os.environ["ATAI_API_KEY"]
-API_ENDPOINT = os.environ["ATAI_API_ENDPOINT"]
-BASE_URL = f"{API_ENDPOINT}/v0.5"
-AUTH = {"Authorization": f"Bearer {API_KEY}"}
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from atai_api import fetch_ref, list_all  # noqa: E402
 
 
-def get_outputs(job_id: str, limit: int = 50) -> list:
-    """Fetch all output metadata (paginated)."""
-    outputs = []
-    offset = 0
-    while True:
-        resp = requests.get(
-            f"{BASE_URL}/batch/jobs/{job_id}/outputs",
-            headers=AUTH,
-            params={"limit": limit, "offset": offset},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        outputs.extend(data["outputs"])
-        total = data["total"]
-        print(f"  Fetched {len(outputs)}/{total} output records...")
-        if offset + limit >= total:
-            break
-        offset += limit
-    return outputs
+def get_outputs(job_id: str) -> list:
+    """Fetch all output metadata (cursor-paginated)."""
+    return list_all(f"/batch/jobs/{job_id}/outputs")
 
 
-def download_file(url: str, dest: str):
-    """Download a file from a presigned URL."""
-    resp = requests.get(url)
-    resp.raise_for_status()
+def download_file(ref: str, dest: str) -> int:
+    """Download one output (data.ref is an /api/files/.../content path)."""
+    content = fetch_ref(ref)
     with open(dest, "wb") as f:
-        f.write(resp.content)
-    return len(resp.content)
+        f.write(content)
+    return len(content)
 
 
 def main():
@@ -88,11 +60,11 @@ def main():
     total_bytes = 0
 
     for i, out in enumerate(outputs):
-        url = out["data"]["ref"]
+        ref = out["data"]["ref"]
         filename = out["data"]["filename"]
         dest = os.path.join(output_dir, filename)
 
-        nbytes = download_file(url, dest)
+        nbytes = download_file(ref, dest)
         total_bytes += nbytes
 
         if (i + 1) % 50 == 0 or i == 0 or i == len(outputs) - 1:

@@ -14,9 +14,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-# Load env
-export $(grep -v '^#' "$PROJECT_DIR/.env" | xargs)
-BASE_URL="${ATAI_API_ENDPOINT}/v0.5"
+source "$PROJECT_DIR/env.sh"
 
 FILE_ID="${1:-ghost_iot_home_yesterday.jsonl}"
 
@@ -97,13 +95,13 @@ done
 echo
 
 echo "[3/3] Job events:"
-EVENTS=$(/usr/bin/curl -s "$BASE_URL/batch/jobs/$JOB_ID/events" \
+EVENTS=$(/usr/bin/curl -s "$BASE_URL/batch/jobs/$JOB_ID/events?limit=100" \
   -H "Authorization: Bearer $ATAI_API_KEY")
 
 echo "$EVENTS" | python3 -c "
 import sys, json
 data = json.load(sys.stdin)
-for event in reversed(data.get('events', [])):
+for event in reversed(data.get('data', [])):
     level = event['level']
     msg = event['message']
     ts = event['created_at'][11:19]
