@@ -1,13 +1,13 @@
 # Multipart Upload with curl (step-by-step)
 
-Manual curl commands for the 3-step presigned URL upload flow. For the GHOST-IoT demo the prepared JSONL files are very small (< 1 KB), so the server will return a `simple` upload strategy (one presigned PUT). The flow below works regardless of strategy.
+Manual curl commands for the 3-step presigned URL upload flow. The GHOST-IoT JSONL files are small (a few KB), so the server returns a single part (one presigned PUT). The same flow works for many parts.
 
 ## Prerequisites
 
 ```bash
 export ATAI_API_KEY="your-api-key"
-export ATAI_API_ENDPOINT="https://api.u1.archetypeai.app"
-export BASE_URL="$ATAI_API_ENDPOINT/v0.5"
+export ATAI_API_ENDPOINT="https://platform.u1.archetypeai.app"
+export BASE_URL="$ATAI_API_ENDPOINT/api"
 ```
 
 ## Step 1: Initiate Upload
@@ -31,18 +31,18 @@ curl -s -X POST "$BASE_URL/files/uploads/initiate" \
   | python3 -m json.tool
 ```
 
-Response (simple strategy):
+Response:
 ```json
 {
   "upload_id": "upl_abc123...",
   "file_uid": "fil_xyz789...",
-  "strategy": "simple",
+  "file_name": "ghost_iot_home_yesterday.jsonl",
+  "total_bytes": 6280,
   "num_parts": 1,
-  "part_size": 512,
   "parts": [
-    {"part_number": 1, "url": "https://s3...presigned-url...", "offset": 0, "length": 512}
+    {"part_number": 1, "url": "https://s3...presigned-url...", "offset": 0, "length": 6280, "expires_at": "..."}
   ],
-  "expires_at": "..."
+  "is_resume": false
 }
 ```
 

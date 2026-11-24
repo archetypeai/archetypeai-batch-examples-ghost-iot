@@ -54,4 +54,6 @@ data/ghost_iot_*_yesterday_[0-9]*.jsonl
 # Stale temp files from older prep scripts
 data/tmp*.flows
 EXPERIENCE.md
-!data/wifi_flows_multihome_1gb.csv
+
+# run_multihome.py runs (inputs, manifests, predictions per stage)
+data/multihome/

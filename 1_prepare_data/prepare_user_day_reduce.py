@@ -3,11 +3,10 @@
 REDUCE stage 2a: user-day. Fold per-user device-day narratives -> 1 narrative per human.
 
 Inputs:
-  --predictions  data/predictions_device_day.jsonl   (joined output from
-                 4_download_outputs/extract_predictions.py over the device-day
-                 batch outputs — keyed by file_id OR by line_index)
+  --predictions  data/predictions_device_day.jsonl   ({line_index, prediction}
+                 per device-day output line, as written by run_multihome.py)
   --manifest     data/manifest_device_day.jsonl     (sidecar from
-                 prepare_device_day_reduce.py)
+                 prepare_device_day_reduce_a2.py --stage b)
 
 Output:
   --output           data/user_day_reduce.jsonl    (6 records — one per human)
@@ -18,9 +17,8 @@ devices like smart_speaker and thermostat are NOT attributed to any user;
 they're folded into the house-level summary instead).
 
 Stage 2 (device-day) emits a single 24-record JSONL through one batch job, so
-the downloaded output is a single multi-line file. extract_predictions.py
-keys it by file_id when one is recoverable; otherwise the predictions JSONL
-can be a sequence of {line_index, prediction} records that we join against
+the downloaded output is a single multi-line file. The predictions JSONL is
+a sequence of {line_index, prediction} records joined against
 manifest_device_day's line_index.
 
 Usage:
@@ -89,7 +87,7 @@ def load_predictions_keyed(path: str, manifest: list[dict]) -> dict[int, str]:
     if have_file_id_key and not have_line_index_key:
         raise SystemExit(
             f"Predictions in {path} are keyed by file_id but device-day stage uses "
-            f"line_index. Re-run extract_predictions.py and ensure line_index is preserved."
+            f"line_index. Write predictions as {line_index, prediction} records."
         )
     _ = by_line  # placeholder for symmetry; unused
     return out

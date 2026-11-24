@@ -14,34 +14,26 @@ Usage:
     python create_activity_detection_job.py --file ghost_iot_home_yesterday.jsonl --name my-run
 
     # Section 9: many files in one batch job. Manifest is one filename per line
-    # (as written by 2_upload/upload_directory.py).
+    # (each file already uploaded).
     python create_activity_detection_job.py --file-list data/uploaded_file_ids.txt --name multihome-per-device-hour
 
 Flow:
-    1. POST /v0.5/batch/jobs          -> create batch job
-    2. GET  /v0.5/batch/jobs/{id}     -> poll status
-    3. GET  /v0.5/batch/jobs/{id}/events -> view logs
+    1. POST /api/batch/jobs          -> create batch job
+    2. GET  /api/batch/jobs/{id}     -> poll status
+    3. GET  /api/batch/jobs/{id}/events -> view logs
 """
 
 import argparse
 import json
 import os
+import sys
 import time
 
 import requests
 
-ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".env")
-with open(ENV_PATH) as f:
-    for line in f:
-        line = line.strip()
-        if "=" in line and not line.startswith("#"):
-            k, v = line.split("=", 1)
-            os.environ[k] = v
-
-API_KEY = os.environ["ATAI_API_KEY"]
-API_ENDPOINT = os.environ["ATAI_API_ENDPOINT"]
-BASE_URL = f"{API_ENDPOINT}/v0.5"
-AUTH = {"Authorization": f"Bearer {API_KEY}"}
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from atai_api import AUTH, BASE_URL, list_all  # noqa: E402
+from background import add_background_flag, maybe_detach  # noqa: E402
 
 TERMINAL_STATUSES = {"COMPLETED", "FAILED", "CANCELLED"}
 
@@ -97,24 +89,26 @@ def create_job(payload: dict) -> dict:
         headers={**AUTH, "Content-Type": "application/json"},
         json=payload,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        raise SystemExit(f"POST /batch/jobs failed (HTTP {resp.status_code}): {resp.text[:500]}")
     return resp.json()
 
 
 def get_job(job_id: str) -> dict:
-    resp = requests.get(f"{BASE_URL}/batch/jobs/{job_id}", headers=AUTH)
-    resp.raise_for_status()
-    return resp.json()
+    """Fetch a job, retrying through network drops (a laptop going offline)."""
+    while True:
+        try:
+            resp = requests.get(f"{BASE_URL}/batch/jobs/{job_id}", headers=AUTH, timeout=60)
+            resp.raise_for_status()
+            return resp.json()
+        except (requests.ConnectionError, requests.Timeout) as e:
+            print(f"  poll failed, retrying in 30 s: {e}", flush=True)
+            time.sleep(30)
 
 
-def get_events(job_id: str, limit: int = 100) -> dict:
-    resp = requests.get(
-        f"{BASE_URL}/batch/jobs/{job_id}/events",
-        headers=AUTH,
-        params={"limit": limit},
-    )
-    resp.raise_for_status()
-    return resp.json()
+def get_events(job_id: str) -> list:
+    """All events for a job, oldest first."""
+    return list_all(f"/batch/jobs/{job_id}/events")
 
 
 def default_job_name(file_id: str) -> str:
@@ -142,16 +136,14 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=1024,
                         help="Maximum tokens Newton may generate per record (default: 1024). "
                              "Bump to 2048+ for reduce calls that need to synthesize multi-paragraph summaries.")
-    parser.add_argument("--model-variant", default=None,
-                        help="Pin a specific C model variant via parameters.worker.config.model_variant. "
-                             "Example: 'newton/c:2.4.0-7b-base'. Leave unset to use the platform's default. "
-                             "Workaround for the C 2.5.1 memory-budget bug that causes OOM at bs=1 even when "
-                             "per-line context fits — see README §10.6.")
+    parser.add_argument("--model-variant", default="newton/c:2.6.0-8b-fp8-base",
+                        help="Newton C model via parameters.worker.config.model_variant "
+                             "(default: newton/c:2.6.0-8b-fp8-base, records up to ~32 KB). "
+                             "'newton/c:2.5.1-8b-base' is the platform default: slower, records up to ~16 KB "
+                             "(README §9.3).")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Cap the engine's batch size via parameters.worker.config.batch_size. "
-                             "When unset, the platform's engine starts at bs=16 and may escalate to bs=24, "
-                             "tripping unrecoverable OOM cascades on long jobs (§10.6). "
-                             "Recommended: --batch-size 4 for 10 KB chunks, --batch-size 1 for 16 KB chunks.")
+                             "Unset = the engine calibrates its own batch size (recommended).")
     parser.add_argument("--filter-pattern", default=None,
                         help="Regex applied to each filename in --file-list. Only matching entries are submitted. "
                              "Use to skip stale entries from prior runs — e.g. --filter-pattern '__c\\d{4}\\.jsonl$' "
@@ -160,7 +152,9 @@ def main():
                         help="If set, split the file list into batches of this size and create one job per batch "
                              "(suffixed -part-NNN-of-NNN). The platform's /batch/jobs endpoint has a request-size "
                              "limit (observed: 37K file_ids → HTTP 413 Payload Too Large). Recommended: 5000.")
+    add_background_flag(parser, default_log="outputs/logs/activity_detection_job.log")
     args = parser.parse_args()
+    maybe_detach(args)
 
     if args.file_list:
         file_ids = load_file_list(args.file_list)
@@ -233,7 +227,7 @@ def main():
         print(" Monitor each via the UI or:")
         print(f"   for j in $(jq -r .job_id {out_path}); do")
         print(f"     curl -s -H \"Authorization: Bearer $ATAI_API_KEY\" \\")
-        print(f"       \"$ATAI_API_ENDPOINT/v0.5/batch/jobs/$j\" | jq -r '.status'; done")
+        print(f"       \"$BASE_URL/batch/jobs/$j\" | jq -r '.status'; done")
         print()
         print(" Download all outputs:")
         print(f"   for j in $(jq -r .job_id {out_path}); do")
@@ -266,8 +260,7 @@ def main():
     print()
 
     print("[3/3] Job events:")
-    events = get_events(job_id)
-    for event in reversed(events.get("events", [])):
+    for event in get_events(job_id):
         level = event["level"]
         msg = event["message"]
         ts = event["created_at"][11:19]
@@ -282,6 +275,8 @@ def main():
         print(f" Completed: {job['completed_at']}")
     if job.get("failed_at"):
         print(f" Failed:    {job['failed_at']}")
+    if job.get("error"):
+        print(f" Error:     {job['error']}")
     print("=" * 60)
     print()
     print("Next: download outputs with")

@@ -13,9 +13,7 @@ Two scopes:
 
   --remote   Attempt to delete files from the Archetype AI platform that this
              demo has uploaded, using the file_uids in
-             data/uploaded_file_ids.jsonl. The platform's DELETE endpoint isn't
-             documented in this repo's README — the script tries DELETE
-             /v0.5/files/{file_uid} and falls back to /v0.5/files/{filename}.
+             data/uploaded_file_ids.jsonl (DELETE /api/files/{file_uid}).
              Failures are reported but don't abort the remaining deletes.
 
 Default: --dry-run, no flags. Prints what *would* be deleted; touches nothing.
@@ -204,18 +202,6 @@ def delete_local(files: list[str], directories: list[str], dry_run: bool) -> Non
 # ---------------------------------------------------------------------------
 # Platform-side cleanup
 # ---------------------------------------------------------------------------
-def load_env() -> tuple[str, str]:
-    env_path = os.path.join(REPO_DIR, ".env")
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if "=" in line and not line.startswith("#"):
-                    k, v = line.split("=", 1)
-                    os.environ.setdefault(k, v)
-    return os.environ.get("ATAI_API_KEY", ""), os.environ.get("ATAI_API_ENDPOINT", "")
-
-
 def gather_remote() -> list[dict]:
     """Read uploaded_file_ids.jsonl entries (filename, file_uid)."""
     path = os.path.join(REPO_DIR, "data", "uploaded_file_ids.jsonl")
@@ -234,35 +220,23 @@ def gather_remote() -> list[dict]:
     return out
 
 
-def try_delete(api_key: str, base_url: str, filename: str, file_uid: str) -> tuple[bool, str]:
-    """Attempt the most likely DELETE endpoints for a single file. Returns (ok, message)."""
-    headers = {"Authorization": f"Bearer {api_key}"}
-    candidates = []
-    if file_uid:
-        candidates.append(("file_uid", f"{base_url}/files/{file_uid}"))
-    if filename:
-        candidates.append(("filename", f"{base_url}/files/{filename}"))
+def try_delete(file_uid: str) -> tuple[bool, str]:
+    """DELETE /api/files/{file_uid}. Returns (ok, message)."""
+    sys.path.insert(0, REPO_DIR)
+    from atai_api import AUTH, BASE_URL
 
-    if not candidates:
-        return False, "no file_uid or filename"
-
-    last_status = ""
-    for label, url in candidates:
-        try:
-            resp = requests.delete(url, headers=headers, timeout=20)
-        except requests.RequestException as e:
-            last_status = f"{label}: {type(e).__name__}: {e}"
-            continue
-        if resp.ok:
-            return True, f"{label} OK ({resp.status_code})"
-        last_status = f"{label}: HTTP {resp.status_code} {resp.text[:120]}"
-        # 404 is the closest signal that this endpoint doesn't exist.
-        # Try the next candidate.
-
-    return False, last_status
+    if not file_uid:
+        return False, "no file_uid"
+    try:
+        resp = requests.delete(f"{BASE_URL}/files/{file_uid}", headers=AUTH, timeout=20)
+    except requests.RequestException as e:
+        return False, f"{type(e).__name__}: {e}"
+    if resp.ok:
+        return True, f"OK ({resp.status_code})"
+    return False, f"HTTP {resp.status_code} {resp.text[:120]}"
 
 
-def delete_remote(entries: list[dict], dry_run: bool, base_url: str, api_key: str) -> None:
+def delete_remote(entries: list[dict], dry_run: bool) -> None:
     print()
     print("=" * 60)
     print(" Remote cleanup")
@@ -283,22 +257,15 @@ def delete_remote(entries: list[dict], dry_run: bool, base_url: str, api_key: st
         print("  No files to delete.")
         return
 
-    if not api_key or not base_url:
-        print("  ERROR: ATAI_API_KEY / ATAI_API_ENDPOINT not set; skipping remote cleanup.")
-        return
-
     ok = 0
     fail = 0
-    print()
-    print("  Note: the DELETE endpoint isn't documented in this repo's README.")
-    print("  Trying /v0.5/files/{file_uid} first, then /v0.5/files/{filename}.")
     print()
 
     failures: list[tuple[str, str]] = []
     for i, e in enumerate(entries, start=1):
         filename = e.get("filename", "")
         file_uid = e.get("file_uid", "")
-        success, msg = try_delete(api_key, base_url, filename, file_uid)
+        success, msg = try_delete(file_uid)
         if success:
             ok += 1
             if i <= 5 or i == len(entries):
@@ -315,11 +282,6 @@ def delete_remote(entries: list[dict], dry_run: bool, base_url: str, api_key: st
         print(f"  First few failures:")
         for fn, msg in failures[:5]:
             print(f"    - {fn}: {msg}")
-        if ok == 0:
-            print()
-            print("  None of the DELETE endpoints worked. The platform may not expose a")
-            print("  per-file delete API — confirm with the platform team. As a workaround,")
-            print("  rename your local files (e.g. add a session suffix) before re-uploading.")
 
 
 def main():
@@ -343,10 +305,8 @@ def main():
         delete_local(files, directories, dry_run=dry_run or not args.local)
 
     if args.remote or dry_run:
-        api_key, api_endpoint = load_env()
-        base_url = f"{api_endpoint}/v0.5" if api_endpoint else ""
         entries = gather_remote()
-        delete_remote(entries, dry_run=dry_run or not args.remote, base_url=base_url, api_key=api_key)
+        delete_remote(entries, dry_run=dry_run or not args.remote)
 
     if dry_run:
         print()

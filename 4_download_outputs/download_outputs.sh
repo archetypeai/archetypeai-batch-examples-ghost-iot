@@ -13,9 +13,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-# Load env
-export $(grep -v '^#' "$PROJECT_DIR/.env" | xargs)
-BASE_URL="${ATAI_API_ENDPOINT}/v0.5"
+source "$PROJECT_DIR/env.sh"
 
 JOB_ID="${1:?Usage: $0 <job_id> [output_dir]}"
 OUTPUT_DIR="${2:-outputs/$JOB_ID}"
@@ -28,43 +26,29 @@ echo "  Job:    $JOB_ID"
 echo "  Saving: $OUTPUT_DIR/"
 echo
 
-# Step 1: Get total count
-echo "[1/2] Fetching output list..."
-FIRST_PAGE=$(/usr/bin/curl -s "$BASE_URL/batch/jobs/$JOB_ID/outputs?limit=1&offset=0" \
-  -H "Authorization: Bearer $ATAI_API_KEY")
-TOTAL=$(echo "$FIRST_PAGE" | python3 -c "import sys,json; print(json.load(sys.stdin)['total'])")
-echo "  Total: $TOTAL files"
-echo
-
-# Step 2: Download all files (paginated)
-echo "[2/2] Downloading $TOTAL files..."
-
-OFFSET=0
-LIMIT=50
+# Outputs are cursor-paginated ({data, has_more, next_cursor}); each data.ref is
+# an /api/files/.../content path on the platform root that needs the API key.
+ROOT="${BASE_URL%/api}"
+echo "[1/1] Downloading outputs..."
 DOWNLOADED=0
-
-while [ "$OFFSET" -lt "$TOTAL" ]; do
-    # Fetch page of outputs
-    PAGE=$(/usr/bin/curl -s "$BASE_URL/batch/jobs/$JOB_ID/outputs?limit=$LIMIT&offset=$OFFSET" \
+AFTER=""
+while : ; do
+    PAGE=$(/usr/bin/curl -sf "$BASE_URL/batch/jobs/$JOB_ID/outputs?limit=100${AFTER:+&after=$AFTER}" \
       -H "Authorization: Bearer $ATAI_API_KEY")
-
-    # Extract URLs and filenames
-    NUM_ITEMS=$(echo "$PAGE" | python3 -c "import sys,json; print(len(json.load(sys.stdin)['outputs']))")
-
-    for i in $(seq 0 $((NUM_ITEMS - 1))); do
-        URL=$(echo "$PAGE" | python3 -c "import sys,json; print(json.load(sys.stdin)['outputs'][$i]['data']['ref'])")
-        FNAME=$(echo "$PAGE" | python3 -c "import sys,json; print(json.load(sys.stdin)['outputs'][$i]['data']['filename'])")
-
-        /usr/bin/curl -s -o "$OUTPUT_DIR/$FNAME" "$URL"
+    while IFS=$'\t' read -r REF FNAME; do
+        [ -n "$REF" ] || continue
+        /usr/bin/curl -sf -o "$OUTPUT_DIR/$FNAME" "$ROOT$REF" -H "Authorization: Bearer $ATAI_API_KEY"
         DOWNLOADED=$((DOWNLOADED + 1))
-
-        if [ $((DOWNLOADED % 50)) -eq 0 ] || [ "$DOWNLOADED" -eq "$TOTAL" ]; then
-            PCT=$((DOWNLOADED * 100 / TOTAL))
-            echo "  [$PCT%] $DOWNLOADED/$TOTAL  $FNAME"
-        fi
-    done
-
-    OFFSET=$((OFFSET + LIMIT))
+        if [ $((DOWNLOADED % 50)) -eq 0 ]; then echo "  $DOWNLOADED files..."; fi
+    done < <(echo "$PAGE" | python3 -c "
+import sys, json
+for o in json.load(sys.stdin)['data']:
+    print(o['data']['ref'] + '\t' + o['data']['filename'])")
+    AFTER=$(echo "$PAGE" | python3 -c "
+import sys, json
+p = json.load(sys.stdin)
+print(p['next_cursor'] if p.get('has_more') and p.get('next_cursor') else '')")
+    [ -n "$AFTER" ] || break
 done
 
 FILE_COUNT=$(ls -1 "$OUTPUT_DIR" | wc -l | tr -d ' ')

@@ -12,9 +12,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
-# Load env
-export $(grep -v '^#' "$PROJECT_DIR/.env" | xargs)
-BASE_URL="${ATAI_API_ENDPOINT}/v0.5"
+source "$PROJECT_DIR/env.sh"
 
 FILE_PATH="${1:?Usage: $0 <file_path>}"
 FILE_NAME="$(basename "$FILE_PATH")"
@@ -44,21 +42,30 @@ echo
 # --- Step 1: Initiate -------------------------------------------------------
 echo "[1/3] Initiating upload..."
 
-INIT_RESPONSE=$(curl -s -X POST "$BASE_URL/files/uploads/initiate" \
+INIT_RESPONSE=$(curl -s -w '\n%{http_code}' -X POST "$BASE_URL/files/uploads/initiate" \
   -H "Authorization: Bearer $ATAI_API_KEY" \
   -H "Content-Type: application/json" \
   -d "{\"filename\":\"$FILE_NAME\",\"file_type\":\"$FILE_TYPE\",\"num_bytes\":$FILE_SIZE}")
+HTTP_CODE="${INIT_RESPONSE##*$'\n'}"
+INIT_RESPONSE="${INIT_RESPONSE%$'\n'*}"
+if [ "$HTTP_CODE" = "409" ]; then
+  echo "  '$FILE_NAME' already exists on the platform; skipping upload."
+  echo "  Use it directly: python 3_batch_jobs/create_activity_detection_job.py --file $FILE_NAME"
+  exit 0
+elif [ "$HTTP_CODE" -ge 300 ]; then
+  echo "  HTTP $HTTP_CODE from /files/uploads/initiate: $INIT_RESPONSE" >&2
+  exit 1
+fi
 
 UPLOAD_ID=$(echo "$INIT_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['upload_id'])")
+# If anything below fails, abort the upload so the filename isn't left stuck in UPLOADING.
+trap 'curl -s -X POST "$BASE_URL/files/uploads/$UPLOAD_ID/abort" -H "Authorization: Bearer $ATAI_API_KEY" > /dev/null; echo "  upload aborted" >&2' ERR
 FILE_UID=$(echo "$INIT_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['file_uid'])")
-STRATEGY=$(echo "$INIT_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['strategy'])")
 NUM_PARTS=$(echo "$INIT_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin)['num_parts'])")
-PART_SIZE=$(echo "$INIT_RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('part_size',0))")
 
 echo "      upload_id : $UPLOAD_ID"
 echo "      file_uid  : $FILE_UID"
-echo "      strategy  : $STRATEGY"
-echo "      parts     : $NUM_PARTS x $(echo "$PART_SIZE" | awk '{printf "%.0f MB", $1/1048576}')"
+echo "      parts     : $NUM_PARTS"
 echo
 
 # Save initiate response for part extraction
@@ -89,17 +96,9 @@ print(part['length'])
     OFFSET=$(echo "$PART_INFO" | sed -n '2p')
     LENGTH=$(echo "$PART_INFO" | sed -n '3p')
 
-    # Extract the part from the file using dd
+    # Extract bytes [OFFSET, OFFSET+LENGTH) of the file (portable: macOS and Linux)
     PART_FILE="/tmp/atai_part_${PART_NUM}.bin"
-    BLOCK_SIZE=1048576  # 1 MB
-    SKIP_BLOCKS=$((OFFSET / BLOCK_SIZE))
-    COUNT_BLOCKS=$((LENGTH / BLOCK_SIZE))
-    REMAINDER=$((LENGTH % BLOCK_SIZE))
-
-    dd if="$FILE_PATH" of="$PART_FILE" bs=$BLOCK_SIZE skip=$SKIP_BLOCKS count=$COUNT_BLOCKS 2>/dev/null
-    if [ "$REMAINDER" -gt 0 ]; then
-        dd if="$FILE_PATH" of="$PART_FILE" bs=1 skip=$((OFFSET + COUNT_BLOCKS * BLOCK_SIZE)) count=$REMAINDER oflag=append conv=notrunc 2>/dev/null
-    fi
+    tail -c +$((OFFSET + 1)) "$FILE_PATH" | head -c "$LENGTH" > "$PART_FILE"
 
     PART_START=$(date +%s)
 
