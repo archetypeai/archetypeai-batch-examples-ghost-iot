@@ -22,7 +22,7 @@ import requests
 # Config
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from atai_api import AUTH, BASE_URL  # noqa: E402
+from atai_api import AUTH, BASE_URL, list_all  # noqa: E402
 from background import add_background_flag, maybe_detach  # noqa: E402
 
 
@@ -160,6 +160,12 @@ def main():
         init = initiate_upload(filename, file_size, file_type=file_type)
     except FileAlreadyExists as exc:
         print()
+        existing = next((f for f in list_all("/files") if f.get("file_id") == exc.filename), {})
+        if existing.get("file_status") == "FILE_STATUS_UPLOADING":
+            print(f"  File '{exc.filename}' exists on the platform but is stuck mid-upload")
+            print(f"  ({existing.get('file_uid')}). Jobs on it fail with 'could not read input'.")
+            print( "  Rename your local file and upload it again (README §9.4).")
+            sys.exit(1)
         print(f"  File '{exc.filename}' already exists on the platform.")
         print( "  Skipping upload — you can reference it directly in batch jobs:")
         print(f"      python 3_batch_jobs/create_activity_detection_job.py --file {exc.filename}")
